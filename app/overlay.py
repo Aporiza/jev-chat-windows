@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """浅色置顶回复助手：回复建议和独立设置页。发送始终由用户确认。"""
-import os
-import sys
 import threading
 from datetime import datetime
 from math import isfinite
 from types import SimpleNamespace
 
 from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QPixmap
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QSizeGrip, QSizePolicy,
+    QApplication, QFrame, QHBoxLayout, QPushButton, QSizeGrip, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 from qfluentwidgets import (
@@ -20,11 +18,11 @@ from qfluentwidgets import (
     setCustomStyleSheet, setFont, setTheme, setThemeColor,
 )
 
-from app import i18n, settings
+from app import settings
 from app.version import VERSION
 from core import jev_client, llm, providers
 from core.questions import CHOICE_LABELS
-from app.i18n import LANGUAGES, T, bind
+from app.i18n import T, bind
 
 _LOG_LINES = 300
 _MUTED = "#68776f"
@@ -37,41 +35,6 @@ _RELATIONSHIPS = [
 
 def _choice(answers, name):
     return T(CHOICE_LABELS[name].get((answers.get(name) or {}).get("choice"), "暂未判断"))
-
-
-def _mp_banner_path() -> str:
-    """打包后在 _MEIPASS/docs，源码跑在仓库 docs/。"""
-    root = getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    return os.path.join(root, "docs", "wechat-mp.png")
-
-
-class _MpBanner(QLabel):
-    """公众号长条横幅，宽度跟着设置页走，高度按原图比例。"""
-
-    def __init__(self, path, parent=None):
-        super().__init__(parent)
-        self._src = QPixmap(path)
-        self._shown = 0
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-    def hasHeightForWidth(self):
-        return True
-
-    def heightForWidth(self, w):
-        if self._src.isNull() or w <= 0 or self._src.width() <= 0:
-            return 0
-        return max(1, round(w * self._src.height() / self._src.width()))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        w = self.width()
-        if w <= 0 or w == self._shown or self._src.isNull():
-            return
-        h = self.heightForWidth(w)
-        self._shown = w
-        self.setPixmap(self._src.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        if self.height() != h:
-            self.setFixedHeight(h)
 
 
 class _FitCombo(ComboBox):
@@ -233,7 +196,7 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None, on_language_changed=None):
+                 on_toggle_debug=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -244,7 +207,6 @@ class Overlay:
         self.on_toggle_capture = on_toggle_capture
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
-        self.on_language_changed = on_language_changed
         self.result_of = result_of
         self.cands = []
         self.cards = []
@@ -253,7 +215,7 @@ class Overlay:
         self._compact = None  # 断点模式：None 保证 _relayout 第一次调用必定生效
         self._pageLayouts = []
         self._hintLabels = []
-        self.feeds = {}  # {会话名: [(who, name, text, timestamp)]}，换语言只重画说话人标签
+        self.feeds = {}  # {会话名: [(who, name, text, timestamp)]}
         self._feed_entries = []
         self.counts = {}  # {会话名: 消息条数}
         self.hers = {}  # {会话名: 对方最近一句}
@@ -501,29 +463,6 @@ class Overlay:
         heading.addWidget(_tool(FIF.RETURN, "返回回复建议", self._back_home))
         heading.addWidget(_tlabel("设置", 23, "#24382d", True), 1)
         body.addLayout(heading)
-        banner = _mp_banner_path()
-        if os.path.exists(banner):
-            body.addWidget(_MpBanner(banner))
-
-        language = _Surface()
-        box = QVBoxLayout(language)
-        box.setContentsMargins(16, 16, 16, 18)
-        box.setSpacing(12)
-        language_label = _tlabel("界面语言 / Language", 16, "#304c3c", True)
-        box.addWidget(language_label)
-        self.languageBox = ComboBox()
-        self.languageBox.setMinimumWidth(0)
-        self.languageBox.addItems([name for name, code in LANGUAGES])
-        bind(self.languageBox, "界面语言 / Language", "setAccessibleName")
-        language_label.setBuddy(self.languageBox)
-        self.languageBox.currentIndexChanged.connect(self._language_changed)
-        box.addWidget(self.languageBox)
-        self.languageHint = _label("", 12, _MUTED)
-        box.addWidget(self.languageHint)
-        self.languageOverrideHint = _tlabel("本次选择立即生效；下次启动仍优先使用 JEVCHAT_LANG 指定的语言。", 12, _MUTED)
-        box.addWidget(self.languageOverrideHint)
-        body.addWidget(language)
-
         body.addWidget(_tlabel("调整关系背景，配置判断和起草用的两个模型。", 13, _MUTED))
         preference = _Surface()
         box = QVBoxLayout(preference)
@@ -798,41 +737,7 @@ class Overlay:
         group.modelBox.setText(model)
         bind(group.status, "", "setText")
 
-    def _load_language(self):
-        lang = i18n.language()
-        index = next((i for i, (_, code) in enumerate(LANGUAGES) if code == lang), 0)
-        self.languageBox.blockSignals(True)
-        self.languageBox.setCurrentIndex(index)
-        self.languageBox.blockSignals(False)
-        bind(self.languageHint, "选择后立即生效，并自动保存。", "setText")
-        self.languageOverrideHint.setVisible(bool(os.environ.get("JEVCHAT_LANG", "").strip()))
-
-    def _language_changed(self, index):
-        if not 0 <= index < len(LANGUAGES):
-            return
-        try:
-            settings.save(lang_text=LANGUAGES[index][1])
-        except Exception:
-            self._load_language()
-            bind(self.languageHint, "语言保存失败，请检查配置文件是否可写后重试。", "setText")
-            return
-        i18n.reload(LANGUAGES[index][1])
-        self._retranslate()
-        bind(self.languageHint, "语言已切换并保存。", "setText")
-        if self.on_language_changed:
-            self.on_language_changed()
-
-    def _retranslate(self):
-        """只重画文字，保留输入、控件状态和进行中的模型请求。"""
-        i18n.retranslate(self.win)
-        blocked = self.relationshipBox.blockSignals(True)
-        for index, (name, _) in enumerate(_RELATIONSHIPS):
-            self.relationshipBox.setItemText(index, T(name))
-        self.relationshipBox.blockSignals(blocked)
-        self._refresh_history_text()
-
     def _load_settings(self):
-        self._load_language()
         relationship = settings.relationship()
         index = next((i for i, (_, value) in enumerate(_RELATIONSHIPS) if value == relationship),
                      len(_RELATIONSHIPS) - 1)
@@ -924,7 +829,7 @@ class Overlay:
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
         self.settingsButton.setEnabled(False)
-        self.languageBox.setFocus()
+        self.relationshipBox.setFocus()
         self.settingsPage.verticalScrollBar().setValue(0)
 
     def _back_home(self):
