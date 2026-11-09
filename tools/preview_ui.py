@@ -10,17 +10,20 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from unittest.mock import patch
+
+# 直接跑 `python tools/preview_ui.py` 时，sys.path[0] 是 tools/，找不到 app/；把项目根补进去。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import settings
 
 
 _STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug")
 
-# 调试视图预览用的真微信截图（只读进内存，不改不存）；没有就退一张空画面
-_FRAME = Path("/private/tmp/claude-501/-Users-lpitiless-Documents-project-wechatjev"
-              "/26954c2b-b4b9-432e-bad7-0d0b803e4309/images/9.png")
+# 调试预览用的合成聊天图（tools/make_sample_chat.py 生成，不含真实聊天）；没有就退一张空画面
+_FRAME = Path(__file__).resolve().parent.parent / "docs" / "sample_chat.png"
 _AREA = (433, 152, 1298, 767)  # 那张图里的消息区，头部从 y=40 起
 # 消息区裁剪坐标的框：前面这些是真跑一遍 OCR 得到的，灰字/小字那两个是手摆的，凑齐六种颜色
 _BOXES = [

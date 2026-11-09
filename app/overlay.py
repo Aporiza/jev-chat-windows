@@ -497,6 +497,9 @@ class Overlay:
         box.addWidget(context_label)
         self.contextBox = SpinBox()
         self.contextBox.setRange(3, 30)
+        # PySide6 6.12 + PySide6-Fluent-Widgets 1.11.3：SpinBox 内部 QLineEdit 被压成 1px，
+        # 值看不见（实测 2026-11-09）。给 lineEdit 一个最小宽度，值才能显示。
+        self.contextBox.lineEdit().setMinimumWidth(60)
         bind(self.contextBox, "参考的最近消息条数", "setAccessibleName")
         context_label.setBuddy(self.contextBox)
         box.addWidget(self.contextBox)

@@ -1,0 +1,3 @@
+# Offline tests only: no Qt, OCR, SDK or network needed.
+numpy
+pytest

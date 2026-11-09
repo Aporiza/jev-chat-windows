@@ -1,0 +1,24 @@
+name: tests
+
+# 每次 push / PR 跑离线回归测试：不联网、不需要 key、不装 Qt/OCR 重依赖。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: 装测试依赖
+        run: pip install -r requirements-test.txt
+
+      - name: 跑离线测试
+        run: python -m pytest -q
