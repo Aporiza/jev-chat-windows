@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app import settings
 
 
-_STATES = ("ready", "waiting", "loading", "error", "setup", "settings", "paused", "debug")
+_STATES = ("ready", "waiting", "loading", "error", "degraded", "setup", "settings", "paused", "debug")
 
 # 调试预览用的合成聊天图（tools/make_sample_chat.py 生成，不含真实聊天）；没有就退一张空画面
 _FRAME = Path(__file__).resolve().parent.parent / "docs" / "sample_chat.png"
@@ -103,6 +103,11 @@ _RESULT = {
     "reply_to": "阿杰",  # 跟 _SENDERS[0] 一致，让「回复给 …」那行在演示里看得见
 }
 
+# 没有 Jev key 的降级界面：保留候选，但没有推荐位、概率和判断摘要。
+_DEGRADED_RESULT = dict(_RESULT, best_index=None, best_reply=None,
+                        scores=[None, None, None], ranking_status="unavailable",
+                        status="degraded", answers={})
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -113,10 +118,12 @@ def main() -> int:
     args = parser.parse_args()
     target = Path(args.screenshot).expanduser() if args.screenshot else None
 
-    # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；全程就两把 key，都当「已配置」
-    configured = "" if args.state == "setup" else "demo-key"
+    # 演示里：判断走 OpenRouter，起草走 DeepSeek 官网；setup 两把都当未配置，
+    # degraded 只缺 Jev key，用来预览降级界面。
+    jev_configured = "" if args.state in ("setup", "degraded") else "demo-key"
+    llm_configured = "" if args.state == "setup" else "demo-key"
     demo_settings = {"relationship": "friends", "context": 10,
-                     "jev_key": configured, "llm_key": configured,
+                     "jev_key": jev_configured, "llm_key": llm_configured,
                      "jev_provider": "openrouter", "jev_model": "typesafe/jev-1.13",
                      "draft_provider": "deepseek", "draft_model": "deepseek-flash",
                      "draft_base_url": "", "reply_target": True,
@@ -210,8 +217,12 @@ def main() -> int:
                 ov.log_message(who, text, name, timestamp=timestamp, chat=chat)
             ov.set_targets(_GROUP, _SENDERS, _SENDERS[0])  # 群聊才有回复对象这一行
             ov.set_chat(_CHAT)
-            ov.show(_RESULT)
-            ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
+            if args.state == "degraded":
+                ov.show(_DEGRADED_RESULT)
+                ov.set_status("演示模式：未配置 Jev，已跳过判断与排序，只生成候选。", kind="warning")
+            else:
+                ov.show(_RESULT)
+                ov.set_status("演示模式：已生成 3 条建议，点击填入仅模拟操作。", kind="success")
             ov.set_update("9.9.9", "https://github.com/jev-chat/jev-chat-windows/releases/latest")
             if args.state == "loading":
                 ov.set_busy(True)

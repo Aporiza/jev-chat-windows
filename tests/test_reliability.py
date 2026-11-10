@@ -287,6 +287,21 @@ class ApplicationTests(unittest.TestCase):
             self.assertIs(snapshot, config)
             self.assertTrue(app.is_current(version))
 
+    def test_llm_key_alone_starts_degraded_analysis(self):
+        """没有 Jev key 时仍应开始起草，只是提示降级。"""
+        app = self.app
+        clock = types.SimpleNamespace(now=10)
+        self.frame("A", "baseline", visible=[("me", None, "问候")])
+        config = types.SimpleNamespace(jev_key="", llm_key="l", reply_target=False)
+        with patch.object(app.time, "monotonic", side_effect=lambda: clock.now), \
+                patch.object(app.settings, "analysis_settings", return_value=config), \
+                patch.object(app.threading, "Thread") as thread:
+            self.frame("A", "append", [("her", "甲", "在吗")])
+            clock.now += 1
+            app.tick()
+            thread.assert_called_once()
+            app.ov.set_status.assert_any_call("未配置 Jev：只起草候选，跳过判断与排序", "warning")
+
 
 class TargetOverlayTests(unittest.TestCase):
     def test_unidentified_speaker_leaves_single_known_member_selectable(self):

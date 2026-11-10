@@ -64,3 +64,39 @@ git checkout main
 ```
 
 或对单个提交 `git revert <commit>`。改动不涉及数据库、配置格式或密钥，回滚无需迁移。
+
+## 2026-11-10 · 合并可靠性分支 + 无 Jev 降级
+
+### 合并
+
+- 合并 `origin/codex/reliability-fixes`（`bebd2ab`）：回复新鲜度、会话隔离、OCR 相邻帧顺序去重、总时限、填入前核验、按会话偏好、边界/不确定状态。
+- `.github/workflows/test.yml` 两边都新建，冲突解决为统一跑 `python -m pytest -q` 的 Python 3.10–3.12 矩阵。
+
+### 修复
+
+| # | 文件 | 改动 | 原因 |
+|---|---|---|---|
+| 1 | `core/engine.py` | `jev_key=""` 时跳过判断和排序，返回 `status="degraded"`、`ranking_status="unavailable"`，只保留起草阶段 | 没有 Jev key 时不再卡在“请配置模型”，候选仍可用 |
+| 2 | `main.py` | 启动和 `start_pending` 只要求 `LLM_API_KEY`；缺 Jev 时提示降级并继续起草 | 生产版无 Jev key 降级模式 |
+| 3 | `app/overlay.py` | Jev 密钥改为可选；设置页允许只填起草密钥；空态/状态栏显示降级说明；降级结果不显示推荐位 | 设置页原先强制两把 key，用户无法进入降级模式 |
+| 4 | `tools/demo.py` | 无 Jev key 时自动降级；`--mock-jev` 仍走 mock 三段式 | 本地演示不需要 Jev key |
+| 5 | `tools/preview_ui.py` | 新增 `--state degraded` 预览降级界面 | 汇报时可直接展示 UI |
+| 6 | `tests/test_core.py`、`tests/test_reliability.py` | 增加降级引擎和“只填 LLM key 也能开始分析”的测试 | 回归保护 |
+
+### 验证
+
+```powershell
+python -m pytest -q
+# 38 passed
+
+python -m compileall -q app core main.py tools tests
+python tools/preview_ui.py --state ready
+python tools/preview_ui.py --state settings
+python tools/preview_ui.py --state degraded
+```
+
+### 已知遗留
+
+- 没有真实 Jev key 时，降级候选没有意图、边界、紧张度和排序，需要用户自行判断。
+- OCR 顺序恢复在满屏聊天滚到无重叠旧记录后可能不自动恢复；README/KICKOFF 已按实际行为标注，演示时切换会话可重建基线。
+- 无 Jev 降级模式没有接入真实模型做端到端验收；本次用 mock/离线测试验证编排和 UI。

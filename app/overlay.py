@@ -297,8 +297,13 @@ class Overlay:
         self.win.resize(min(440, screen.width() - 32), min(820, screen.height() - 48))
         self.win.move(screen.right() - self.win.width() - 20, screen.top() + 24)
         self._relayout(self.win.width(), self.win.height())  # resizeEvent 补不到构造时这一次
-        self.set_status("等待新消息" if settings.has_key() else "需要配置模型",
-                        "idle" if settings.has_key() else "warning")
+        draft_ready = settings.has_llm_key()
+        if not draft_ready:
+            self.set_status("需要配置模型", "warning")
+        elif not settings.has_jev_key():
+            self.set_status("未配置 Jev：只生成候选", "warning")
+        else:
+            self.set_status("等待新消息", "idle")
         self.win.show()
 
     def _scroll_page(self):
@@ -435,11 +440,15 @@ class Overlay:
         empty_box.addWidget(self.emptyHint)
         self.setupButton = bind(PrimaryPushButton(""), "前往设置")
         self.setupButton.clicked.connect(self.open_settings)
-        self.setupButton.setVisible(not settings.has_key())
+        draft_ready = settings.has_llm_key()
+        degraded = draft_ready and not settings.has_jev_key()
+        self.setupButton.setVisible(not draft_ready)
         empty_box.addWidget(self.setupButton, 0, Qt.AlignHCenter)
-        if not settings.has_key():
+        if not draft_ready:
             bind(self.emptyTitle, "先设置，再开始", "setText")
-            bind(self.emptyHint, "配置模型和关系背景，\n让建议更贴近你们的对话。", "setText")
+            bind(self.emptyHint, "配置起草模型和关系背景，\n让建议更贴近你们的对话。", "setText")
+        elif degraded:
+            bind(self.emptyHint, "未配置 Jev：将跳过判断与排序，\n收到新消息后只生成候选回复。", "setText")
         body.addWidget(self.empty)
         self.replyBox = QVBoxLayout()
         self.replyBox.setSpacing(10)
@@ -565,7 +574,8 @@ class Overlay:
         self._fetched.done.connect(self._models_fetched)
         self.jev = self._model_group(box, "判断 · Jev", "jev", providers.JEV_PROVIDERS)
         box.addWidget(self._hint(
-            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev，必填。"
+            "判断意图、紧张度，并给三条候选排序。两家给的是同一个 Jev。"
+            "不填密钥也能用：自动降级为只起草候选，不判断、不排序。"
         ))
         self.draft = self._model_group(box, "起草 · 语言模型", "draft", providers.DRAFT_PROVIDERS)
         box.addWidget(self._hint(
@@ -795,7 +805,10 @@ class Overlay:
             return
         for group, provider in ((self.jev, jev_provider), (self.draft, draft_provider)):
             name = group.table[provider].name
-            if not group.keyEdit.text().strip() and not group.stored_key():
+            has_key = bool(group.keyEdit.text().strip() or group.stored_key())
+            if group.kind == "jev" and not has_key:
+                continue  # Jev 可选：不填就进入只起草的降级模式
+            if not has_key:
                 self._settings_feedback(lambda group=group:
                                         T("请先填写 {name} 的 API 密钥。").format(name=T(group.keyTitle)), error=True)
                 group.keyEdit.setFocus()
@@ -916,20 +929,23 @@ class Overlay:
 
     def _capture_text(self, on, reason=""):
         """开关状态对应的状态行和空态文案。暂停时仅保留复制。"""
-        configured = settings.has_key()
+        draft_ready = settings.has_llm_key()
+        degraded = draft_ready and not settings.has_jev_key()
         if not on:
             self.invalidate_replies()
             self.set_status(reason or "采集已暂停，聊天内容不再读取", "warning")
-        elif configured:
-            self.set_status("等待新消息", "idle")
+        elif not draft_ready:
+            self.set_status("请先在设置中配置起草模型", "warning")
+        elif degraded:
+            self.set_status("等待新消息 · 未配置 Jev，仅起草", "warning")
         else:
-            self.set_status("请先在设置中配置模型", "warning")
+            self.set_status("等待新消息", "idle")
         if self._busy or self.cands:  # 正在生成或已有候选时，空态卡片本来就看不见
             return
         if not on:
             bind(self.emptyTitle, "采集已暂停", "setText")
             bind(self.emptyHint, "聊天内容暂时不再读取。\n打开标题栏的开关，继续接收新消息。", "setText")
-            self.setupButton.setVisible(not configured)
+            self.setupButton.setVisible(not draft_ready)
         else:
             self._empty_text()
 
@@ -953,11 +969,17 @@ class Overlay:
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""
-        configured = settings.has_key()
-        bind(self.emptyTitle, "等待对方的新消息" if configured else "先设置，再开始")
-        bind(self.emptyHint, "保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
-                            if configured else "配置模型和关系背景，\n让建议更贴近你们的对话。")
-        self.setupButton.setVisible(not configured)
+        draft_ready = settings.has_llm_key()
+        degraded = draft_ready and not settings.has_jev_key()
+        bind(self.emptyTitle, "等待对方的新消息" if draft_ready else "先设置，再开始")
+        if not draft_ready:
+            hint = "配置起草模型和关系背景，\n让建议更贴近你们的对话。"
+        elif degraded:
+            hint = "未配置 Jev：将跳过判断与排序，\n收到新消息后只生成候选回复。"
+        else:
+            hint = "保持聊天窗口打开。\n收到新消息后，回复建议会出现在这里。"
+        bind(self.emptyHint, hint)
+        self.setupButton.setVisible(not draft_ready)
 
     def invalidate_replies(self):
         self._current = False
@@ -980,7 +1002,7 @@ class Overlay:
         if kind == "error" and not self.cands:
             bind(self.emptyTitle, "暂时没有可用的回复", "setText")
             bind(self.emptyHint, "请按上方提示处理。收到新的对方消息后会再次尝试。", "setText")
-            self.setupButton.setVisible(not settings.has_key())
+            self.setupButton.setVisible(not settings.has_llm_key())
 
     def _toggle_history(self):
         self.feed.setVisible(self.feed.isHidden())
@@ -1194,7 +1216,7 @@ class Overlay:
         qss = f"BodyLabel {{ color: {color}; background: transparent; }}"
         setCustomStyleSheet(self.tension, qss, qss)
         self.empty.setVisible(not self.cands)
-        self.insight.setVisible(bool(self.cands))
+        self.insight.setVisible(bool(self.cands) and result.get("status") != "degraded")
         self.referenceNote.setVisible(bool(self.cands) and not self._compact)
         generated_at = result.get("generated_at")
         updated_at = datetime.fromtimestamp(generated_at).strftime("%H:%M") if generated_at else ""
@@ -1206,6 +1228,8 @@ class Overlay:
             self.set_status("对话意图或事实不确定，建议先澄清或等待。", "warning")
         elif not self._current and self.cands:
             self.set_status("此建议已过期，可以复制并自行检查。", "warning")
+        elif result.get("status") == "degraded":
+            self.set_status("未配置 Jev：已跳过判断与排序，候选未排序，请自行确认。", "warning")
         elif result.get("ranking_status") == "failed":
             self.set_status("已生成候选，排序不可用，请自行判断。", "warning")
         elif result.get("status") == "partial":

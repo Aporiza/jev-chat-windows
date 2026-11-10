@@ -121,6 +121,24 @@ def test_engine_raises_when_all_candidates_filtered():
             engine.analyze([("her", "hello")], "friends")
 
 
+def test_engine_degrades_without_jev_key():
+    """没有 Jev key 时不应发判断/排序请求，只用起草模型生成候选。"""
+    with patch.object(engine, "ask") as ask, \
+         patch.object(engine, "draft_candidates", return_value=["甲", "乙", "丙"]) as draft:
+        result = engine.analyze([("her", "你好")], "friends", jev_key="", llm_key="demo")
+    ask.assert_not_called()
+    assert result["status"] == "degraded"
+    assert result["ranking_status"] == "unavailable"
+    assert result["candidates"] == ["甲", "乙", "丙"]
+    assert result["best_index"] is None and result["best_reply"] is None
+    assert result["scores"] == [None, None, None]
+    assert result["stages"]["judge"]["status"] == "skipped"
+    assert result["stages"]["rank"]["status"] == "skipped"
+    assert result["stages"]["draft"]["status"] == "ok"
+    assert draft.call_args.kwargs["api_key"] == "demo"
+    assert not draft.call_args.kwargs["guidance"]
+
+
 def test_redact_secrets(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "sk-secret")
     assert redact_secrets("key=sk-secret") == "key=[REDACTED]"

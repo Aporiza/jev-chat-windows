@@ -9,9 +9,10 @@
     export JEV_API_KEY=... && export LLM_API_KEY=...(mac/Linux)
     python tools/demo.py
 
-没有 Jev key 时，可以只模拟判断/排序、仍用真实起草模型：
+没有 Jev key 时有两种跑法：
 
-    python tools/demo.py --mock-jev
+    python tools/demo.py              # 自动降级：跳过判断/排序，只起草候选
+    python tools/demo.py --mock-jev   # 用本地固定判断模拟 Jev，仍跑完整三段式
 
 默认：判断走 OpenRouter，起草走 DeepSeek 官网直连。换别家改下面两个常量
 （可选的来源见 core/providers.py 的两张表）。
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +32,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="repla
 
 from core.engine import analyze
 from core.jev_client import JevError
+from core.providers import JEV_ENV, LEGACY
 from core.questions import guidance_text
 
 MESSAGES = [
@@ -88,18 +91,28 @@ def main() -> int:
     print("对话:")
     for w, t in MESSAGES:
         print(f"  {w}: {t}")
+    # 显式空串 = 降级模式；--mock-jev 传一个占位值，让 analyze 走被 patch 的 ask。
+    jev_key = "mock" if args.mock_jev else (
+        os.environ.get(JEV_ENV) or os.environ.get(LEGACY[JEV_ENV]) or "")
     try:
         if args.mock_jev:
             print("\n[Jev] 本地 mock，不联网")
             with patch("core.engine.ask", _mock_ask):
-                r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER)
+                r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER,
+                            jev_key=jev_key)
         else:
-            r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER)
+            r = analyze(MESSAGES, RELATIONSHIP, provider=PROVIDER, jev_provider=JEV_PROVIDER,
+                        jev_key=jev_key)
     except JevError as e:
         print(f"\n失败: {e}")
         return 1
 
+    if r["status"] == "degraded":
+        print("\n[降级] 未配置 Jev：跳过判断与排序，只起草候选")
+
     print("\n判断:")
+    if r["status"] == "degraded":
+        print("  （未配置 Jev，跳过判断）")
     for name in ("literal_question", "true_intent", "danger_level",
                  "should_reply_now", "best_action", "she_needs", "tension_resolved"):
         if name in r["answers"]:
@@ -109,16 +122,19 @@ def main() -> int:
     if block:
         print("\n" + block)
 
-    print(f"\n候选（{r['ranking_status']}，★ = 推荐）")
+    ranked = r.get("best_index") is not None
+    label = "已排序，★ = 推荐" if ranked else f"未排序 · {r['ranking_status']}"
+    print(f"\n候选（{label}）")
     scores = r.get("scores")
     for i, c in enumerate(r["candidates"]):
         pct = f"  {scores[i]:.0%}" if i < len(scores) and scores[i] is not None else ""
-        print(f"  {'★' if i == r['best_index'] else ' '} {c}{pct}")
+        print(f"  {'★' if ranked and i == r['best_index'] else ' '} {c}{pct}")
 
     u = r["usage"]
     if u:
-        print(f"\nJev 用量 {u}")
-    print("\n期望核对: true_intent≈confirm_you_care, best_action≈check_history, danger_level 中高档")
+        print(f"\n模型用量 {u}")
+    if r["status"] != "degraded":
+        print("\n期望核对: true_intent≈confirm_you_care, best_action≈check_history, danger_level 中高档")
     return 0
 
 

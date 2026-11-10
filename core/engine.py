@@ -92,11 +92,17 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             thinking: bool = False, jev_provider: str = "openrouter",
             jev_model: str | None = None, *, goal: str = "", is_current=lambda: True,
             jev_key: str | None = None, llm_key: str | None = None) -> dict:
-    """按总时限生成建议。best_index 为 None 表示没有可信排序。"""
+    """按总时限生成建议。best_index 为 None 表示没有可信排序。
+
+    jev_key 显式传空字符串时进入降级模式：跳过 Jev 判断和排序，只用起草模型
+    生成候选，status 为 "degraded"、ranking_status 为 "unavailable"。
+    jev_key=None 仍按原逻辑从环境变量读取/调用，方便直接调 analyze 的调用方。
+    """
     started = monotonic()
     budget = _Budget(timeout, is_current)
     state = build_state(messages, relationship, keep=context, reply_to=reply_to, goal=goal)
     answers, usage, stages = {}, {}, {}
+    jev_enabled = jev_key is None or bool(str(jev_key).strip())
 
     def stage(name, operation, stage_usage=None):
         started_at = monotonic()
@@ -108,6 +114,9 @@ def analyze(messages: list, relationship: str, model: str | None = None,
             raise
         finally:
             metrics["elapsed_ms"] = round((monotonic() - started_at) * 1000)
+
+    def skip(name):
+        stages[name] = {"status": "skipped", "usage": {}, "elapsed_ms": 0}
 
     def judge(name, questions):
         def call():
@@ -127,7 +136,10 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         except JevError:
             return {}
 
-    answers.update(judge("judge", dict(JUDGE_QUESTIONS)))
+    if jev_enabled:
+        answers.update(judge("judge", dict(JUDGE_QUESTIONS)))
+    else:
+        skip("judge")
     boundary = (_choice(answers, "best_action") == "respect_boundary"
                 or _choice(answers, "true_intent") == "set_boundary")
     candidates, best_index, scores = [], None, []
@@ -143,7 +155,11 @@ def analyze(messages: list, relationship: str, model: str | None = None,
         if not candidates:
             raise JevError("起草结果没有可用候选回复")
         budget.check()
-        if len(candidates) >= 2:
+        if not jev_enabled:
+            scores = [None] * len(candidates)
+            ranking_status = "unavailable"
+            skip("rank")
+        elif len(candidates) >= 2:
             questions = build_rank_question(candidates)
             if not answers:
                 questions.update(JUDGE_QUESTIONS)
@@ -173,7 +189,9 @@ def analyze(messages: list, relationship: str, model: str | None = None,
     budget.check()
     uncertain = (_choice(answers, "best_action") == "clarify"
                  or _choice(answers, "true_intent") == "uncertain")
-    status = ("boundary" if boundary else "uncertain" if uncertain else "partial"
+    status = ("boundary" if boundary else "uncertain" if uncertain
+              else "degraded" if not jev_enabled
+              else "partial"
               if len(candidates) < 3 or ranking_status != "ranked" or not _choice(answers, "best_action")
               else "complete")
     return {

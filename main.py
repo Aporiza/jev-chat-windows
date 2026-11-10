@@ -203,13 +203,15 @@ def start_pending():
         return
     state["wanted"] = None
     config = settings.analysis_settings(version.title)
-    if not config.jev_key or not config.llm_key:
-        ov.set_status("请先在设置中配置判断和起草模型", "warning")
+    if not config.llm_key:
+        ov.set_status("请先在设置中配置起草模型", "warning")
         return
     chat = chat_of(version.title)
     target = target_of(version.title) if config.reply_target else None
     state["inflight"] = version
     ov.set_busy(True)
+    if not config.jev_key:
+        ov.set_status("未配置 Jev：只起草候选，跳过判断与排序", "warning")
     threading.Thread(target=analyze_bg,
                      args=(tuple(chat["history"]), version, config, target), daemon=True).start()
 
@@ -352,9 +354,11 @@ if __name__ == "__main__":
     on_toggle_capture(True)
     if settings.debug_view():
         set_debug(True)
-    if not settings.has_jev_key():
-        ov.set_status("请先在设置中配置模型", "warning")
+    if not settings.has_llm_key():
+        ov.set_status("请先在设置中配置起草模型", "warning")
         ov.after(0, ov.open_settings)
+    elif not settings.has_jev_key():
+        ov.set_status("未配置 Jev：只生成候选，跳过判断与排序", "warning")
     if settings.check_update() and update.parse_version(VERSION):
         threading.Thread(target=check_update_bg, daemon=True).start()
     ov.after(50, tick)

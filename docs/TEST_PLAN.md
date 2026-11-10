@@ -72,23 +72,25 @@ python core/engine.py
 # 3) UI 预览：合成数据，不采集、不联网、不操作真实微信
 python tools/preview_ui.py --state ready
 python tools/preview_ui.py --state settings
+python tools/preview_ui.py --state degraded
 python tools/preview_ui.py --state debug
 
 # 4) 三段式模拟：只 mock Jev，起草仍走真实 DeepSeek
 $env:LLM_API_KEY = "sk-..."
 python tools/demo.py --mock-jev
 
-# 5) 验证没有 Jev key 时的真实行为（预期失败，错误信息要可读）
+# 5) 验证没有 Jev key 时的降级行为（只起草，不报错）
 python tools/demo.py
 ```
 
 预期：
 
-- `pytest` 全部通过（当前 10 个）。
-- 设置页「参考上下文」显示 `10`，不是空白。
+- `pytest` 全部通过（当前 38 个）。
+- 设置页「参考上下文」显示 `10`，不是空白；Jev 密钥提示为可选。
 - `--state debug` 有合成聊天背景和彩色识别框，不是纯黑。
+- `--state degraded` 有候选但没有推荐位/概率，状态栏提示未配置 Jev。
 - `--mock-jev` 输出 3 条候选、推荐项、判断小抄；不代表真实 Jev 质量。
-- 没有 Jev key 时 `tools/demo.py` 报 `JEV_API_KEY is not set`，这是预期。
+- 没有 Jev key 时 `tools/demo.py` 自动降级，输出 3 条候选和“[降级]”提示，不报 `JEV_API_KEY is not set`。
 
 ## 5. 功能测试用例
 
@@ -108,19 +110,21 @@ python tools/demo.py
 | ID | 场景 | 步骤 | 通过标准 |
 |---|---|---|---|
 | B1 | 首页预览 | `python tools/preview_ui.py --state ready` | 悬浮窗正常；候选卡片、推荐标记、填入/复制按钮可见 |
-| B2 | 设置页 | `--state settings` | 「参考上下文」显示数字（重点回归）；关系/风格/模型各控件不撑破宽度 |
+| B2 | 设置页 | `--state settings` | 「参考上下文」显示数字（重点回归）；关系/风格/模型各控件不撑破宽度；「判断 · Jev」提示写明可选 |
 | B3 | 调试视图 | `--state debug` | 有合成聊天背景；绿/蓝/灰/橙/红/黄框和图例一致 |
 | B4 | 错误/暂停态 | `--state error`、`--state paused` | 状态文案清楚；已有候选不被误清空 |
 | B5 | 窄窗口 | 拖动窗口到 <400px 宽 | 进入紧凑模式；不出现文字重叠/按钮消失 |
+| B6 | 降级界面 | `python tools/preview_ui.py --state degraded` | 候选可见；无推荐位/概率/判断摘要；状态栏提示未配置 Jev |
 
 ### C. 本地三段式模拟
 
 | ID | 场景 | 步骤 | 通过标准 |
 |---|---|---|---|
 | C1 | mock Jev + 真实起草 | 设 `LLM_API_KEY`，`python tools/demo.py --mock-jev` | 3 条候选；`best_index` 有推荐；判断小抄出现在输出里 |
-| C2 | 无 Jev key | `python tools/demo.py` | 失败信息明确，不是 Python traceback 糊脸 |
+| C2 | 无 Jev key 降级 | 只设 `LLM_API_KEY`，`python tools/demo.py` | 输出“[降级] 未配置 Jev”；仍有候选；无推荐/排序；不是 traceback |
 | C3 | 候选过滤 | 在 `tools/demo.py` 的 `MESSAGES` 临时换成注入对话（测完还原） | 复读型候选被丢弃；正常候选保留 |
 | C4 | 起草不足 3 条 | 用会只给 1–2 条的模型/提示（可选） | 有追问补齐或按实际条数返回；不 IndexError |
+| C5 | 降级引擎 | `pytest -q` 里的 `test_engine_degrades_without_jev_key` | 不调用 `ask`；`status=degraded`；候选保留；judge/rank 标 skipped |
 
 ### D. 真实微信只读采集（测试账号）
 
@@ -150,7 +154,7 @@ python tools/demo.py
 | ID | 场景 | 步骤 | 通过标准 |
 |---|---|---|---|
 | F1 | 3 分钟脚本 | 按第 8 节走一遍 | 不超时；每一步都能接上 |
-| F2 | 无 Jev key 兜底 | 只用 `preview_ui` + `demo --mock-jev` 走一遍 | 能讲清“这是模拟，不是真实判断” |
+| F2 | 无 Jev key 兜底 | 用 `preview_ui --state degraded`、`demo.py`（自动降级）和 `demo.py --mock-jev` 各走一遍 | 能讲清“降级只起草、不判断/不排序”和“mock 不是真实判断” |
 | F3 | 备用录屏 | 提前录一段完整流程 | 现场网络/微信出问题时能直接播 |
 | F4 | 隐私检查 | 检查演示聊天/截图/录屏 | 无真实姓名、手机号、地址、群名 |
 
@@ -194,16 +198,17 @@ python tools/demo.py
 | 0:00–0:20 | 问题与原则 | 说明“只读、不自动发送、人来决定” |
 | 0:20–0:40 | 架构 | 一张图：截图 → OCR → 判断 → 起草 → 排序 → 悬浮窗 |
 | 0:40–1:20 | UI | 打开 `preview_ui --state ready`，讲候选卡片、推荐、复制/填入 |
-| 1:20–2:20 | 主流程 | 有 Jev key 则真实跑；没有则 `demo.py --mock-jev`，明确说“Jev 是本地 mock” |
+| 1:20–2:20 | 主流程 | 有 Jev key 则真实跑；没有则 `demo.py`（自动降级，只起草）或 `demo.py --mock-jev`，明确说“降级不判断/不排序”或“Jev 是本地 mock” |
 | 2:20–2:45 | 调试视图 | 展示 OCR 框、左右分人、过滤规则；讲局限 |
 | 2:45–3:00 | 收尾 | 隐私边界、下一步、致谢 |
 
 备用方案（按优先级）：
 
 1. 真实微信 + 真实 Jev key；
-2. 真实微信采集 + `demo.py --mock-jev`（只 mock 判断/排序）；
-3. 只播 `preview_ui` + 提前录好的完整流程视频；
-4. 只播录屏 + 讲架构图。
+2. 真实微信采集 + 无 Jev key 降级起草；
+3. 真实微信采集 + `demo.py --mock-jev`（只 mock 判断/排序）；
+4. 只播 `preview_ui` + 提前录好的完整流程视频；
+5. 只播录屏 + 讲架构图。
 
 ## 9. 时间安排
 
@@ -219,7 +224,7 @@ python tools/demo.py
 
 - A2、B2、C1、D1、F1 全部通过；无 P0 缺陷。
 - 设置页「参考上下文」可见；`preview_ui --state debug` 不是纯黑。
-- 没有 Jev key 时，团队能明确切换到 mock 演示，不把 mock 结果说成真实判断。
+- 没有 Jev key 时，降级模式能生成候选，界面明确提示“未配置 Jev、不判断/不排序”；团队也能切换到 mock 演示，不把降级/mock 结果说成真实判断。
 - 真实采集测试只用测试账号/假消息；演示材料通过隐私检查。
 - 备用录屏能在断网/微信异常时独立播放。
 - `docs/CHANGELOG.md` 与实际改动一致；提交记录可追溯。
