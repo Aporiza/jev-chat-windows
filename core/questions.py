@@ -29,9 +29,11 @@ JUDGE_QUESTIONS: dict = {
             "If they are checking whether you remember something or still care, choose confirm_you_care "
             "even if the words look like a request to 'say it' or to do something. "
             "If they already accepted and closed the matter peacefully, choose close_topic. "
-            "Ending the relationship, deleting you, or 'don't talk to me' is vent_anger, never close_topic."
+            "Distinguish an explicit request to stop contact from anger. If intent cannot be inferred, choose uncertain."
         ),
         "criteria": {
+            "set_boundary": "They explicitly request no further contact or set a clear boundary.",
+            "uncertain": "The available words and context do not support a clear interpretation.",
             "confirm_you_care": (
                 "They are testing whether you remember, pay attention, or still care. "
                 "Signals: 'did you forget again', 'then say it', 'you better', sarcastic 'busy person', "
@@ -115,11 +117,13 @@ JUDGE_QUESTIONS: dict = {
         "type": "choice",
         "instructions": (
             "What type of next action is best? Do not decide whether to send a message immediately. "
-            "Ignore timing. Choose only the action type. "
+            "Choose respect_boundary for explicit no-contact or no-reply requests, regardless of the user goal. Choose clarify if there is insufficient context and clarification would respect their boundary. "
             "If they asked you to recall a specific past message or event and you have not shown that you actually remember it, "
             "choose check_history — do not apologize or invent a plan instead."
         ),
         "criteria": {
+            "respect_boundary": "Respect an explicit request for no reply, no further contact, or space.",
+            "clarify": "A material fact or intended meaning is uncertain. Ask neutrally or wait without guessing.",
             "check_history": (
                 "Look up prior chat or facts before taking a position. "
                 "Use when they ask you to repeat, recall, or prove you remember something specific."
@@ -207,11 +211,13 @@ JUDGE_QUESTIONS: dict = {
 # choice 类答案的中文说法，界面和起草小抄共用这一份（app/overlay.py 从这里导）。
 CHOICE_LABELS: dict = {
     "true_intent": {
+        "set_boundary": "明确表达边界", "uncertain": "意图不确定",
         "confirm_you_care": "希望确认你在意", "vent_anger": "表达不满或受伤",
         "request_action": "希望你采取行动", "seek_explanation": "希望了解原因",
         "casual_chat": "轻松交流", "close_topic": "平和结束话题",
     },
     "best_action": {
+        "respect_boundary": "尊重边界，暂停联系", "clarify": "信息不足，先澄清或等待",
         "check_history": "先核对聊天记录", "apologize": "为已知问题道歉",
         "give_commitment": "给出具体承诺", "explain": "说明事实与原因",
         "acknowledge": "回应并表达理解", "say_less": "简短回应或留白",
@@ -250,7 +256,7 @@ def guidance_text(answers: dict) -> str:
 
 
 def build_state(messages: list, relationship: str, keep: int = 10,
-                reply_to: str | None = None) -> dict:
+                reply_to: str | None = None, goal: str = "") -> dict:
     """messages: (from, text) / (from, text, name) / dict（name 可选）。from 只认 her/me。
 
     name = 群里的发言人；有 name 就当群聊（chat.is_group）。reply_to = 群里指定的回复对象。
@@ -278,6 +284,8 @@ def build_state(messages: list, relationship: str, keep: int = 10,
     }
     if reply_to:
         chat["reply_to"] = str(reply_to)
+    if goal.strip():
+        chat["communication_goal"] = goal.strip()
     return {"chat": chat}
 
 
@@ -292,7 +300,7 @@ def build_rank_question(candidates: list[str]) -> dict:
             "instructions": (
                 "Which candidate reply is the most appropriate next message, "
                 "given the conversation and the other person's true need? "
-                "Prefer a reply that matches the best action type. "
+                "Prefer a reply that matches the best action and the user’s stated goal, while respecting explicit boundaries. "
                 "Penalize dismissive, over-promising, or off-topic replies. "
                 "If the facts are not yet confirmed, prefer the candidate that looks them up "
                 "instead of faking memory or a vague apology."

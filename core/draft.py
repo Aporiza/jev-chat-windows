@@ -157,7 +157,8 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
                      model: str | None = None, base_url: str | None = None,
                      timeout: float = 30, keep: int = 10,
                      reply_to: str | None = None, style: str = "", thinking: bool = False,
-                     guidance: str | None = None) -> list[str]:
+                     guidance: str | None = None, *, goal: str = "", api_key: str | None = None,
+                     request=None, usage_sink=None) -> list[str]:
     """messages: [(from, text)] 或 [(from, text, name)]，from ∈ {her, me}，name = 群里的发言人；
     只看最近 keep 条。返回最多 3 条中文候选（过滤后可能是 0 条，调用方要处理）。
 
@@ -182,18 +183,27 @@ def draft_candidates(messages: list, relationship: str, provider: str = "deepsee
         user += "\n\n我平时是这么说话的（模仿用词、长短、标点习惯）：\n" + "\n".join(samples)
     if style.strip():
         user += f"\n\n我对自己口吻的描述：{style.strip()}"
+    if goal.strip():
+        user += f"\n\n我的沟通目标：{goal.strip()}。请尊重对方的明确边界；事实不清楚时澄清或等待。"
     if reply_to:
         user += f"\n\n这是群聊。你要回复的是「{reply_to}」的话，三条候选都对 TA 说，不要@别人。"
     if guidance and guidance.strip():
         user += f"\n\n{guidance.strip()}"
     user += "\n\n输出恰好 3 条候选，JSON 数组，每条一句。"
-    key = _api_key(LLM_ENV)  # 起草只有这一把 key，换来源不用重填
-    # 1.2：DeepSeek 自己推荐的闲聊档位，0.8 出来的话太板正
-    # max_tokens：三句话本来 400 够，但思考过程也算进 max_tokens，开了思考模式 400 会把答案截断
-    call = lambda turns: chat(  # noqa: E731 —— 三个参数会变，其余每次都一样
-        spec.protocol, base_url or spec.base, key, model or spec.default, SYSTEM, turns,
-        temperature=1.2, max_tokens=4000 if thinking else 400, thinking=thinking,
-        extra_body=spec.extra(thinking), headers=spec.headers, timeout=timeout)
+    key = api_key if api_key is not None else _api_key(LLM_ENV)
+
+    def call(turns):
+        def send(remaining):
+            observed = {}
+            content = chat(spec.protocol, base_url or spec.base, key, model or spec.default, SYSTEM, turns,
+                        temperature=1.2, max_tokens=4000 if thinking else 400, thinking=thinking,
+                        extra_body=spec.extra(thinking), headers=spec.headers, timeout=remaining,
+                        usage_sink=observed.update if usage_sink else None)
+            return content, observed
+        content, observed = request(send) if request else send(timeout)
+        if usage_sink:
+            usage_sink(observed)
+        return content
 
     content = call([user])
     her_recent = _her_recent(messages)

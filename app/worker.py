@@ -4,18 +4,12 @@
 只往队列里丢纯 tuple/str（底色 bg 是 numpy，留在这边不过队列）。帧全程内存，绝不落盘。"""
 import ctypes
 import time
-import traceback
 
 import numpy as np
 
 from app import chatapps
-from app.capture import Capture, chat_area, unminimize
-from app.ocr import Reader, read_title, similar
-
-
-def _err(q):
-    """异常压成一行发给父进程，子进程的 stderr 一般没人看得见。"""
-    q.put(("status", " ".join(traceback.format_exc().split())[-200:]))
+from app.capture import Capture, chat_area, layout_signature, unminimize, window_identity
+from app.ocr import Reader, read_title
 
 
 def _packet(full, area, title, reader, lines):
@@ -31,76 +25,58 @@ def _packet(full, area, title, reader, lines):
             "ocr_ms": reader.last_ms if reader else 0, "ts": time.time()}
 
 
-def run(q, hwnd, enabled, debug_on, app_key=None):
-    """enabled 置位=采集，清掉=暂停。暂停时停掉 WGC 会话（Windows 那圈黄色采集边框也跟着没了），
-    恢复时重开一个；readers 一直留着，去重状态不丢，恢复后不会把屏幕上的旧消息再报一遍。
-    debug_on 置位才往队列里送整帧（一帧 2~3MB），关着一点额外活都不干。"""
+def run(q, hwnd, enabled, debug_on, app_key, epoch, identity):
+    """只在标题和布局可确认时识别消息。每次恢复用新进程和新比较基线。"""
     ctypes.windll.user32.SetProcessDPIAware()
     app = chatapps.get(app_key)
-    cap = None
-    readers = {}  # {会话名: Reader}，一个会话一套去重状态
-    title, head = "", None  # 当前会话名 / 上一帧的头部像素
-    last_area = None  # 上次发给父进程的 4 元组，变了才再发一次
-    warned = False  # 消息区识别失败是否已经报过，拖窗口时别每帧刷一条
-    while True:
-        if not enabled.is_set():
-            if cap is not None:
-                cap.stop()
-                cap = None
-                q.put(("paused",))
-            enabled.wait()
-            continue
-        if cap is None:
-            try:
-                cap = Capture(hwnd)
-            except Exception as e:
-                q.put(("dead", "无法开始采集：" + (" ".join(str(e).split())[:120] or type(e).__name__)))
-                enabled.clear()  # 自己清掉，下一圈就去等着，别一秒重试几十次
-                continue
-            q.put(("resumed",))
-        if not cap.alive():
-            break
-        try:
+    title, head, reader = "", None, None
+
+    def changed():
+        epoch.value += 1
+        return epoch.value
+
+    try:
+        cap = Capture(hwnd, changed=changed)
+    except Exception:
+        q.put(("dead", "无法开始采集"))
+        return
+    try:
+        q.put(("resumed",))
+        while enabled.is_set() and cap.alive() and window_identity(hwnd) == identity:
             unminimize(hwnd)
-            full = cap.settled()
-            if full is not None:
-                reader, lines = None, []  # 调试视图要用，消息区没认出来时就是空的
-                area = chat_area(full)  # 每次停稳都重算：拖完窗口微信布局会晚一拍才铺好，只按尺寸变化算一次会锁死
+            packet = cap.settled()
+            if packet is None:
+                time.sleep(0.05)
+                continue
+            stamp, full = packet
+            try:
+                area = chat_area(full)
+                cap.set_area(area, stamp)
                 if area is None:
-                    if not warned:
-                        q.put(("status", "消息区认不出来（窗口太小？）"))
-                        warned = True
-                else:
-                    warned = False
-                    cap.area = area  # 采集线程拿它做 diff
-                    x0, y0, x1, y1, bg, y_pane = area
-                    rect = (x0, y0, x1, y1)
-                    if rect != last_area:
-                        q.put(("area", rect))
-                        last_area = rect
-                    crop = full[y_pane:y0, x0:x1]  # 头部：会话名在这里
-                    if head is None or not np.array_equal(crop, head):  # 名字没动就别白跑一次 OCR
-                        head = crop
-                        name = read_title(crop, app)
-                        # OCR 抖一下（「小分队」↔「小分认」）不能分裂出一个新会话
-                        name = next((k for k in readers if similar(k, name)), name) if name else ""
-                        # ponytail: 认不出就沿用上次；开头就认不出给个占位名，总比把消息全丢了强
-                        name = name or title or "当前会话"
-                        if name != title:
-                            title = name
-                            q.put(("chat", title))
-                    reader = readers.setdefault(title, Reader(app))
-                    lines = reader.read(full[y0:y1, x0:x1], bg)
-                    new = reader.new_lines(lines)
-                    if new:
-                        q.put(("lines", title, new, rect))
+                    title, head, reader = "", None, None
+                    q.put(("frame", stamp, "", None, "unknown", [], []))
+                    continue
+                x0, y0, x1, y1, bg, y_pane = area
+                crop = full[y_pane:y0, x0:x1]
+                name = title if head is not None and np.array_equal(crop, head) else read_title(crop, app)
+                if not name:
+                    title, head, reader = "", None, None
+                    q.put(("frame", stamp, "", None, "unknown", [], []))
+                    continue
+                if name != title:
+                    reader = Reader(app)
+                title, head = name, crop
+                lines = reader.read(full[y0:y1, x0:x1], bg)
+                new = reader.new_lines(lines)
+                visible = [(who, sender, text) for who, sender, text, _ in lines]
+                signature = layout_signature(full, area)
+                q.put(("frame", stamp, title, signature, reader.transition, new, visible))
                 if debug_on.is_set():
                     q.put(("debug", _packet(full, area, title, reader, lines)))
-        except Exception:
-            _err(q)  # 一帧出错不退出
-        time.sleep(0.05)
-    q.put(("dead", "采集停了（聊天窗口关了？）"))
-    try:
-        cap.wait()  # 采集线程若是报错死的，这里把错抛出来
-    except Exception:
-        _err(q)
+            except Exception:
+                title, head, reader = "", None, None
+                q.put(("frame", stamp, "", None, "unknown", [], []))
+    finally:
+        changed()
+        cap.stop()
+        q.put(("dead", "采集已停止，请确认聊天窗口已打开"))

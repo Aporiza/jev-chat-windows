@@ -26,6 +26,9 @@ jobs:
           python-version: '3.11'
           cache: pip
 
+      - name: 离线回归测试
+        run: python -m unittest discover -s tests -v
+
       - name: 装依赖
         run: pip install -r requirements.txt pyinstaller
 

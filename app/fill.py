@@ -46,46 +46,103 @@ def set_clipboard(text):
     raise RuntimeError("OpenClipboard 连续失败，剪贴板被其他程序占用")
 
 
-def fill(hwnd, area, text):
-    """area = 消息区 (x0, y0, x1, y1)；输入框就在底线 y1 下面。"""
-    from app.capture import unminimize
+u32.GetForegroundWindow.restype = w.HWND
+u32.SetForegroundWindow.argtypes = [w.HWND]
+u32.GetWindowRect.argtypes = [w.HWND, ctypes.POINTER(w.RECT)]
+u32.WindowFromPoint.argtypes = [w.POINT]
+u32.WindowFromPoint.restype = w.HWND
+u32.GetAncestor.argtypes = [w.HWND, w.UINT]
+u32.GetAncestor.restype = w.HWND
+u32.IsIconic.argtypes = [w.HWND]
+u32.IsChild.argtypes = [w.HWND, w.HWND]
 
-    set_clipboard(text)
+
+class GUIThreadInfo(ctypes.Structure):
+    _fields_ = [("cbSize", w.DWORD), ("flags", w.DWORD), ("hwndActive", w.HWND),
+                ("hwndFocus", w.HWND), ("hwndCapture", w.HWND), ("hwndMenuOwner", w.HWND),
+                ("hwndMoveSize", w.HWND), ("hwndCaret", w.HWND), ("rcCaret", w.RECT)]
+
+
+u32.GetGUIThreadInfo.argtypes = [w.DWORD, ctypes.POINTER(GUIThreadInfo)]
+dwmapi = ctypes.windll.dwmapi
+dwmapi.DwmGetWindowAttribute.argtypes = [w.HWND, w.DWORD, w.LPVOID, w.DWORD]
+
+
+def _bounds(hwnd):
     r = w.RECT()
-    if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:  # 扩展边界，跟 WGC 帧对齐
-        u32.GetWindowRect(hwnd, ctypes.byref(r))
-    x0, _, _, y1 = area
-    cx, cy = r.left + x0 + 60, r.top + y1 + 40  # 分隔线下 40px = 输入框文字区；工具栏和「发送」在输入区最底下，碰不到
-    unminimize(hwnd)
+    if dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(r), ctypes.sizeof(r)) != 0:
+        if not u32.GetWindowRect(hwnd, ctypes.byref(r)):
+            raise RuntimeError("无法核验窗口坐标")
+    return r.left, r.top, r.right, r.bottom
 
-    # SetForegroundWindow 有前台窗口保护，普通后台进程会被拒；AttachThreadInput 绕过
-    fg = u32.GetForegroundWindow()
-    if fg != hwnd:
+
+def _require(condition):
+    if not condition:
+        raise RuntimeError("当前聊天窗口、布局或输入焦点已变化，请复制后自行粘贴")
+
+
+def fill(hwnd, identity, layout, text, still_valid):
+    """核验实际窗口和像素，点击输入区，再确认焦点后粘贴。"""
+    from app.capture import fresh_layout, window_identity
+
+    def valid():
+        return still_valid() and window_identity(hwnd) == identity and not u32.IsIconic(hwnd)
+
+    def foreground():
+        return valid() and u32.GetForegroundWindow() == hwnd
+
+    _require(layout and identity and valid())
+    if u32.GetForegroundWindow() != hwnd:
+        # AttachThreadInput requires a message queue, including on a background thread.
+        u32.PeekMessageW(ctypes.byref(w.MSG()), None, 0, 0, 0)
+        fg = u32.GetForegroundWindow()
         fg_tid = u32.GetWindowThreadProcessId(fg, None)
         our_tid = k32.GetCurrentThreadId()
-        u32.AttachThreadInput(our_tid, fg_tid, True)
-        u32.SetForegroundWindow(hwnd)
-        u32.AttachThreadInput(our_tid, fg_tid, False)
-        time.sleep(0.15)  # 给微信一点时间响应前台切换
+        attached = fg_tid and fg_tid != our_tid and u32.AttachThreadInput(our_tid, fg_tid, True)
+        try:
+            u32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                u32.AttachThreadInput(our_tid, fg_tid, False)
+        time.sleep(0.12)
+    _require(foreground())
 
+    bounds = _bounds(hwnd)
+    _require(fresh_layout(hwnd) == layout and foreground() and _bounds(hwnd) == bounds)
+    (height, width), (x0, _, x1, y1, _), _ = layout
+    left, top, right, bottom = bounds
+    _require(right - left == width and bottom - top == height and x1 - x0 >= 140 and height - y1 >= 60)
+    point = w.POINT(left + x0 + 60, top + y1 + 40)
+    set_clipboard(text)
+    clipboard_version = u32.GetClipboardSequenceNumber()
     old = w.POINT()
-    u32.GetCursorPos(ctypes.byref(old))
-    u32.SetCursorPos(cx, cy)
-    time.sleep(0.05)
-    u32.mouse_event(0x2, 0, 0, 0, 0)  # 左键按下
-    u32.mouse_event(0x4, 0, 0, 0, 0)  # 抬起
-    time.sleep(0.05)
-    u32.SetCursorPos(old.x, old.y)
-    time.sleep(0.05)
-    # 光标移到已有文本的绝对末尾：点击落在文字中间时 caret 会插在中间，
-    # 连续多次填入就串行错乱；Ctrl+End 保证新内容永远追加在最后
-    u32.keybd_event(0x11, 0, 0, 0)  # Ctrl 按下
-    u32.keybd_event(0x23, 0, 0, 0)  # End 按下（VK_END）
-    u32.keybd_event(0x23, 0, 2, 0)  # End 抬起
-    u32.keybd_event(0x11, 0, 2, 0)  # Ctrl 抬起
-    time.sleep(0.05)
-    u32.keybd_event(0x11, 0, 0, 0)  # Ctrl
-    u32.keybd_event(0x56, 0, 0, 0)  # V
-    u32.keybd_event(0x56, 0, 2, 0)
-    u32.keybd_event(0x11, 0, 2, 0)
-    # 到此为止。发不发、改不改，人来。
+    _require(u32.GetCursorPos(ctypes.byref(old)))
+    try:
+        _require(u32.SetCursorPos(point.x, point.y))
+        _require(foreground() and _bounds(hwnd) == bounds
+                 and u32.GetAncestor(u32.WindowFromPoint(point), 2) == hwnd)
+        u32.mouse_event(0x2, 0, 0, 0, 0)
+        u32.mouse_event(0x4, 0, 0, 0, 0)
+        time.sleep(0.05)
+    finally:
+        u32.SetCursorPos(old.x, old.y)
+
+    def focused():
+        info = GUIThreadInfo(cbSize=ctypes.sizeof(GUIThreadInfo))
+        return (foreground() and _bounds(hwnd) == bounds
+                and u32.GetGUIThreadInfo(identity[1], ctypes.byref(info))
+                and not (info.flags & 0x1E) and info.hwndActive == hwnd
+                and info.hwndFocus and (info.hwndFocus == hwnd or u32.IsChild(hwnd, info.hwndFocus)))
+
+    def chord(key):
+        _require(focused())
+        u32.keybd_event(0x11, 0, 0, 0)
+        try:
+            u32.keybd_event(key, 0, 0, 0)
+            u32.keybd_event(key, 0, 2, 0)
+        finally:
+            u32.keybd_event(0x11, 0, 2, 0)
+
+    chord(0x23)  # Ctrl+End
+    _require(u32.GetClipboardSequenceNumber() == clipboard_version)
+    chord(0x56)  # Ctrl+V

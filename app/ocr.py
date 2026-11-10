@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """消息区截图 → 谁说了什么。RapidOCR 吃 numpy，不落盘。"""
-import difflib
 import re
 import time
 
@@ -24,15 +23,15 @@ def _engine(app: ChatApp = DEFAULT):
 
 def read_title(header, app: ChatApp = DEFAULT):
     """面板头部那一条截图 → 会话名（numpy RGB）。取最靠上的一行，同一行里取最左的
-    （右边是图标按钮，OCR 不出字；下面那行是公告）。群聊的成员数「(422)」去掉，只留名字当 key。
+    （右边是图标按钮，OCR 不出字；下面那行是公告）。保留精确显示的标题。
     认不出返回 ""。一次约 60ms，所以调用方只在头部像素变了时才问。"""
     res, _ = _engine(app)(header, use_cls=False)
     if not res:
         return ""
     first = min(res, key=lambda r: r[0][0][1])
     row = first[0][0][1] + (first[0][2][1] - first[0][0][1])  # 框底：顶在这之上的算同一行
-    text = min((r for r in res if r[0][0][1] < row), key=lambda r: r[0][0][0])[1]
-    return re.sub(r"\s*[（(]\d+[)）]\s*$", "", text.strip())
+    first = min((r for r in res if r[0][0][1] <= row), key=lambda r: r[0][0][0])
+    return first[1].strip() if first[2] >= 0.75 else ""
 
 
 def who_said(chat, box, app: ChatApp = DEFAULT):
@@ -64,21 +63,18 @@ def who_said(chat, box, app: ChatApp = DEFAULT):
     return ("her" if diff.max() >= 150 else "gray"), bg, ink_h
 
 
-def similar(a, b):
-    """同一段像素挪个位置 OCR 会抖（「傻逼了」↔「傻逼」、「不好意思」↔「不好竟思」），按相似度判同一条。"""
-    if a == b or difflib.SequenceMatcher(None, a, b).ratio() >= 0.75:
-        return True
-    return len(a) == len(b) >= 3 and sum(x != y for x, y in zip(a, b)) <= 1  # 短句错一个字
-
-
 class Reader:
-    """一个会话一个 Reader：lh/seen 各自算各自的，切走再切回来不会把旧消息当新的重报一遍。"""
+    """识别当前会话的消息，比较相邻帧中的有序气泡。"""
 
     def __init__(self, app: ChatApp = DEFAULT):
         self.app = app
         self.ocr = _engine(app)
         self.lh = None  # 正常气泡字高，头一帧定
-        self.seen = []  # [(who, name, text)]，累计，封顶 500
+        self.previous = None
+        self.frontier = ()
+        self.frontier_y = ()
+        self.resync = False
+        self.transition = "baseline"
         self.last_boxes = []  # 调试视图用：[(x0,y0,x1,y1,kind,text)]，消息区裁剪坐标
         self.last_ms = 0  # 上一帧 OCR 耗时
 
@@ -92,19 +88,18 @@ class Reader:
         W = chat.shape[1]
         # 群聊：每条 her 气泡上方一行灰色发言人名（靠左、短、不带冒号、印在面板底色上），从上往下扫，名字带给后面的气泡。
         # 引用块/时间戳/公告带冒号，链接卡片灰字印在气泡底色上，都不会被当成名字。
-        # ponytail: 名字行被 OCR 漏掉时会挂到上一个人头上。
-        name, raw = None, []
+        name, name_bottom, raw = None, 0, []
         for box, text, _ in sorted(res or [], key=lambda r: r[0][0][1]):
             kind, bg, h = who_said(chat, box, self.app)
             xs, ys = [p[0] for p in box], [p[1] for p in box]
             rect = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
             # 印在面板底色上的字都不是消息，群聊发言人名可能在这里。
-            on_pane = np.abs(bg - pane_bg).sum() <= 6
+            on_pane = bg is not None and np.abs(bg - pane_bg).sum() <= 6
             if kind == "gray" or (on_pane and kind == "her"):
                 taken = bool(on_pane and box[0][0] < 0.25 * W and len(text) <= 16
                              and not re.search("[:：]", text))
                 if taken:
-                    name = text
+                    name, name_bottom = text, rect[3]
                 self.last_boxes.append(rect + ("name" if taken else "gray", text))
                 continue
             if kind is None or (self.lh and h < 0.6 * self.lh):
@@ -112,13 +107,15 @@ class Reader:
                 self.last_boxes.append(rect + ("image" if kind is None else "tiny", text))
                 continue
             self.last_boxes.append(rect + (kind, text))
-            raw.append((kind, name if kind == "her" else None, text, box[0][1], box[2][1], h))
+            near_name = name if kind == "her" and 0 <= rect[1] - name_bottom <= max(8, 1.5 * h) else None
+            raw.append((kind, near_name, text, rect[1], rect[3], h))
+            name = None
         if not self.lh and len(raw) >= 3:
             self.lh = float(np.median([r[5] for r in raw]))
         # 同一气泡的多行合并：同人、上一行底到这一行顶的间距不到半个字高（不同气泡之间至少隔一个字高）
         lines = []
         for who, nm, text, top, bottom, h in raw:
-            if lines and lines[-1][0] == who and lines[-1][1] == nm and top - lines[-1][4] < 0.6 * (self.lh or h):
+            if lines and lines[-1][0] == who and nm is None and top - lines[-1][4] < 0.6 * (self.lh or h):
                 lines[-1][2] += text
                 lines[-1][4] = bottom
             else:
@@ -126,17 +123,35 @@ class Reader:
         return [(w, n, t, y) for w, n, t, y, _ in lines]
 
     def new_lines(self, lines):
-        """去重（滚动不重复）→ 这一帧里真正新出现的 [(who, name, text)]。
-        本帧有已知行时只要已知行下方的：往上滚翻出来的旧消息在已知行上方，不算。
-        本帧一行已知的都没有（大图把旧文字全顶出去了、切了聊天、滚远了）：全算，宁可多算不能漏。
-        ponytail: 同一人连发两句一模一样的会吞一句——对触发分析无害。"""
-        known_y = [y for w, n, t, y in lines if self._seen(w, n, t)]
-        floor = max(known_y) if known_y else -1
-        new = [(w, n, t) for w, n, t, y in lines if y > floor and not self._seen(w, n, t)]
-        self.seen.extend((w, n, t) for w, n, t, _ in lines if not self._seen(w, n, t))
-        del self.seen[:-500]
-        return new
-
-    def _seen(self, who, name, text):
-        # 名字不参与判重：名字行滚出画面后同一条消息会从 her(LO) 变成 her，不能算新消息
-        return any(w == who and similar(t, text) for w, _, t in self.seen)
+        """仅把前沿后面有连续重叠证据的气泡当成新消息。"""
+        current = tuple((who, name, text) for who, name, text, _ in lines)
+        positions = tuple(y for _, _, _, y in lines)
+        previous, self.previous = self.previous, current
+        if previous is None:
+            self.frontier, self.frontier_y = current, positions
+            self.transition = "baseline"
+            return []
+        if previous == current:
+            self.transition = "stable" if current == self.frontier and not self.resync else "uncertain"
+            self.frontier_y = positions if current == self.frontier else self.frontier_y
+            return []
+        # 保留前沿，往上滚动再回到原处时不重报。
+        if current and any(self.frontier[i:i + len(current)] == current
+                           for i in range(len(self.frontier))):
+            self.transition = "baseline" if current == self.frontier and not self.resync else "uncertain"
+            if current == self.frontier:
+                self.frontier_y = positions
+            return []
+        for n in range(min(len(self.frontier), len(current)), 0, -1):
+            if self.frontier[-n:] == current[:n]:
+                # 失去前沿后，随滚动上移的重叠内容不能用于恢复生成。
+                certain = previous == self.frontier and (
+                    not self.resync or self.frontier_y[-n:] == positions[:n])
+                self.frontier, self.frontier_y = current, positions
+                self.resync = not certain
+                self.transition = "append" if certain else "uncertain"
+                return list(current[n:]) if certain else []
+        self.frontier, self.frontier_y = current, positions
+        self.resync = True
+        self.transition = "uncertain"
+        return []
