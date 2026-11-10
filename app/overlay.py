@@ -28,6 +28,7 @@ _LOG_LINES = 300
 _MUTED = "#68776f"
 _GREEN = "#18794e"
 _RELATIONSHIPS = [
+    ("未指定", "unspecified"),
     ("恋人", "romantic partners"), ("朋友", "friends"), ("同事", "colleagues"),
     ("家人", "family"), ("自定义", None),
 ]
@@ -187,7 +188,7 @@ class _ReplyCard(_Surface):
 
     def set_available(self, enabled):
         self.fillButton.setEnabled(enabled)
-        self.copyButton.setEnabled(enabled)
+        self.copyButton.setEnabled(True)
 
     def set_compact(self, compact):
         self.box.setContentsMargins(12, 8, 12, 8) if compact else self.box.setContentsMargins(16, 12, 16, 12)
@@ -196,7 +197,7 @@ class _ReplyCard(_Surface):
 
 class Overlay:
     def __init__(self, on_fill, on_toggle_capture=None, on_target_change=None, result_of=None,
-                 on_toggle_debug=None):
+                 on_toggle_debug=None, can_fill=None, on_settings_saved=None):
         """result_of(会话名) → 那个会话上次的结果或 None；切着看别的会话时用它把旧结果放回来。
         on_target_change(会话名, 人名) → 用户在群里挑了回复对象。
         on_toggle_debug(开不开) → 开关调试视图那个独立窗口。"""
@@ -208,6 +209,10 @@ class Overlay:
         self.on_target_change = on_target_change
         self.on_toggle_debug = on_toggle_debug
         self.result_of = result_of
+        self.can_fill = can_fill or (lambda result: True)
+        self.on_settings_saved = on_settings_saved
+        self._result = None
+        self._preferences_chat = ""
         self.cands = []
         self.cards = []
         self._busy = False
@@ -469,6 +474,9 @@ class Overlay:
         box.setContentsMargins(16, 16, 16, 18)
         box.setSpacing(12)
         box.addWidget(_tlabel("回复偏好", 16, "#304c3c", True))
+        self.preferenceScope = _FitCombo()
+        self.preferenceScope.currentIndexChanged.connect(self._load_preferences)
+        box.addWidget(self.preferenceScope)
         relation_label = _tlabel("你们的关系", 13)
         box.addWidget(relation_label)
         self.relationshipBox = ComboBox()
@@ -493,6 +501,11 @@ class Overlay:
         style_label.setBuddy(self.styleEdit)
         box.addWidget(self.styleEdit)
         box.addWidget(self._hint("候选本来就照着你最近发的消息模仿；这里可以再补一句你自己的口吻。"))
+        box.addWidget(_tlabel("沟通目标（可选）", 13))
+        self.goalEdit = LineEdit()
+        bind(self.goalEdit, "例如：确认时间、澄清误会或礼貌结束话题", "setPlaceholderText")
+        bind(self.goalEdit, "沟通目标", "setAccessibleName")
+        box.addWidget(self.goalEdit)
         context_label = _tlabel("参考上下文", 13)
         box.addWidget(context_label)
         self.contextBox = SpinBox()
@@ -740,14 +753,21 @@ class Overlay:
         group.modelBox.setText(model)
         bind(group.status, "", "setText")
 
-    def _load_settings(self):
-        relationship = settings.relationship()
+    def _preference_title(self):
+        return self._preferences_chat if self.preferenceScope.currentIndex() == 1 else ""
+
+    def _load_preferences(self, *_):
+        relationship, style, goal = settings.preferences(self._preference_title())
         index = next((i for i, (_, value) in enumerate(_RELATIONSHIPS) if value == relationship),
                      len(_RELATIONSHIPS) - 1)
         self.relationshipBox.setCurrentIndex(index)
         self.relEdit.setText(relationship if _RELATIONSHIPS[index][1] is None else "")
         self.relEdit.setVisible(_RELATIONSHIPS[index][1] is None)
-        self.styleEdit.setText(settings.style())
+        self.styleEdit.setText(style)
+        self.goalEdit.setText(goal)
+
+    def _load_settings(self):
+        self._load_preferences()
         self.contextBox.setValue(settings.context())
         self.targetSwitch.setChecked(settings.reply_target())
         self._set_group(self.jev, settings.jev_provider(), settings.jev_model())
@@ -795,11 +815,15 @@ class Overlay:
                           draft_base_url_text=base,
                           reply_target_on=self.targetSwitch.isChecked(),
                           style_text=self.styleEdit.text().strip(),
+                          goal_text=self.goalEdit.text().strip(),
+                          preference_title=self._preference_title(),
                           thinking_on=self.thinkingSwitch.isChecked(),
                           check_update_on=self.updateSwitch.isChecked())
         except Exception:
             self._settings_feedback("保存失败，请检查配置文件是否可写后重试。", error=True)
             return
+        if self.on_settings_saved:
+            self.on_settings_saved()
         self._load_settings()
         self._render_targets()  # 开关刚改过，回到首页时这一行该显该藏得重算一次
         self._settings_feedback("设置已保存，将用于下一次回复。")
@@ -829,6 +853,14 @@ class Overlay:
 
     def open_settings(self):
         if self.pages.currentWidget() != self.settingsPage:
+            self._preferences_chat = self._shown
+            self.preferenceScope.blockSignals(True)
+            self.preferenceScope.clear()
+            self.preferenceScope.addItem(T("全局默认偏好"))
+            if self._preferences_chat:
+                self.preferenceScope.addItem(T("会话偏好 · {name}").format(name=self._preferences_chat))
+            self.preferenceScope.setCurrentIndex(0)
+            self.preferenceScope.blockSignals(False)
             self._load_settings()
         self.pages.setCurrentWidget(self.settingsPage)
         self.settingsButton.setEnabled(False)
@@ -842,10 +874,12 @@ class Overlay:
         self.settingsButton.setEnabled(True)
 
     def _fill(self, index):
-        if self._busy or not self._current or index >= len(self.cands):
+        if self._busy or not self.can_fill(self._result) or index >= len(self.cands):
             return
         try:
-            self.on_fill(self.cands[index])
+            if self.on_fill(self.cands[index]) is False:
+                self.set_status("正在核验当前聊天窗口和输入框…", "busy")
+                return
         except Exception as e:
             # 状态栏保持友好文案；真实原因和压缩堆栈进聊天记录，认得出是哪一步炸的
             import traceback
@@ -856,7 +890,7 @@ class Overlay:
         self.set_status("已尝试填入，请确认内容后发送。", "success")
 
     def _copy(self, index):
-        if self._busy or not self._current or index >= len(self.cands):
+        if index >= len(self.cands):
             return
         self.app.clipboard().setText(self.cands[index])
         self.set_status("回复已复制，可粘贴并修改。", "success")
@@ -881,9 +915,10 @@ class Overlay:
         self._capture_text(on, reason)
 
     def _capture_text(self, on, reason=""):
-        """开关状态对应的状态行和空态文案。已有的候选不受影响，暂停了照样能填入/复制。"""
+        """开关状态对应的状态行和空态文案。暂停时仅保留复制。"""
         configured = settings.has_key()
         if not on:
+            self.invalidate_replies()
             self.set_status(reason or "采集已暂停，聊天内容不再读取", "warning")
         elif configured:
             self.set_status("等待新消息", "idle")
@@ -914,7 +949,7 @@ class Overlay:
             if not self.cands:
                 self._empty_text()
         for card in self.cards:
-            card.set_available(self._current and not busy)
+            card.set_available(self._current and not busy and self.can_fill(self._result))
 
     def _empty_text(self):
         """空态卡片的默认文案，配好没配好两套说法。"""
@@ -927,7 +962,9 @@ class Overlay:
     def invalidate_replies(self):
         self._current = False
         if self.cands:
-            bind(self.updated, "上次建议", "setText")
+            generated_at = self._result.get("generated_at") if self._result else None
+            time_label = datetime.fromtimestamp(generated_at).strftime("%H:%M") if generated_at else ""
+            bind(self.updated, lambda: " ".join(filter(None, (time_label, T("上次建议")))))
         for card in self.cards:
             card.set_available(False)
 
@@ -1009,6 +1046,9 @@ class Overlay:
     def set_chat(self, title):
         """微信切到了哪个会话：登记进下拉框并自动跟过去，不触发用户选择的回调。"""
         if not title:
+            self._chat = ""
+            self._follow_text()
+            self.invalidate_replies()
             return
         browsing = self._shown != self._chat  # 正看着的就是它、但之前是「浏览中」：也得重画，把填入放开
         self._chat = title
@@ -1066,17 +1106,25 @@ class Overlay:
             return
         self.targetBox.blockSignals(True)
         self.targetBox.clear()
-        self.targetBox.addItems(senders)
-        self.targetBox.setCurrentIndex(senders.index(current) if current in senders else 0)
+        if current in senders:
+            self.targetBox.addItems(senders)
+            self.targetBox.setCurrentIndex(senders.index(current))
+        else:
+            self.targetBox.addItems([T("未指定回复对象"), *senders])
+            self.targetBox.setCurrentIndex(0)
         self.targetBox.blockSignals(False)
 
     def _on_target_selected(self, index):
         """用户挑了回复对象。浏览别的会话时改的就是那个会话的对象——记录、候选也都按会话走，口径一致。"""
-        name = self.targetBox.itemText(index)
-        if not name:
+        senders, current = self.targets.get(self._shown, ([], None))
+        has_target = current in senders
+        sender_index = index if has_target else index - 1
+        if not 0 <= sender_index < len(senders):
             return
-        senders, _ = self.targets.get(self._shown, ([], None))
+        name = senders[sender_index]
         self.targets[self._shown] = (senders, name)
+        if not has_target:
+            self._render_targets()
         self.set_status(lambda: T("按「{name}」重新生成…").format(name=name), "busy")
         if self.on_target_change:
             self.on_target_change(self._shown, name)
@@ -1088,12 +1136,16 @@ class Overlay:
     def _follow_text(self):
         bind(self.chatFollow, ("跟随" if self._shown == self._chat else "浏览中") if self._chat else "")
 
+    def displayed_result(self):
+        return self._result
+
     def show_cached(self, result):
         """把某个会话上次的结果放回界面；没有就回到空态。浏览别的会话时只给看不给填——
         微信当前开着的不是它，填进去就串会话了。"""
         if result:
             self.show(result)
         else:
+            self._result = None
             self.cands = []
             self._clear_cards()
             self.insight.hide()
@@ -1103,25 +1155,27 @@ class Overlay:
             self._empty_text()
         if self._shown != self._chat:
             self.invalidate_replies()
-            self.set_status(lambda: T("正在浏览「{name}」，只看不填；切回这个会话才能用。").format(name=self._shown))
+            self.set_status(lambda: T("正在浏览「{name}」，建议可复制。").format(name=self._shown))
 
     def show(self, result):
         """按推荐顺序展示，按钮始终绑定 candidates 的原始索引。"""
+        self._result = result
         self.cands = result["candidates"]
         self.set_busy(False)
-        self._current = bool(self.cands)
+        self._current = bool(self.cands) and self.can_fill(result)
         self._clear_cards()
-        best = result.get("best_index", 0)
+        best = result.get("best_index")
         if best not in range(len(self.cands)):
-            best = 0
+            best = None
         raw_scores = result.get("scores") or []
         scores = [raw_scores[i] if i < len(raw_scores) else None for i in range(len(self.cands))]
-        if not any(scores):  # 全 0/None（旧结果或接口未返回）就不展示百分比
+        if best is None:
             scores = [None] * len(self.cands)
         # 按概率降序排，推荐位（API 给的 choice）强制第一，同分按原索引
         order = sorted(range(len(self.cands)), key=lambda i: (i != best, -(scores[i] or 0), i))
         for position, index in enumerate(order):
             card = _ReplyCard(self, index, recommended=index == best, number=position, score=scores[index])
+            card.set_available(self._current)
             self.replyBox.addWidget(card)
             self.cards.append(card)
         reply_to = result.get("reply_to")
@@ -1142,9 +1196,21 @@ class Overlay:
         self.empty.setVisible(not self.cands)
         self.insight.setVisible(bool(self.cands))
         self.referenceNote.setVisible(bool(self.cands) and not self._compact)
-        updated_at = datetime.now().strftime("%H:%M")
-        bind(self.updated, lambda: updated_at + " " + T("更新"))
-        if self.cands:
+        generated_at = result.get("generated_at")
+        updated_at = datetime.fromtimestamp(generated_at).strftime("%H:%M") if generated_at else ""
+        label = "更新" if self._current else "上次建议"
+        bind(self.updated, lambda: " ".join(filter(None, (updated_at, T(label)))))
+        if result.get("status") == "boundary":
+            self.set_status("对方表达了明确边界，建议暂停联系。", "warning")
+        elif result.get("status") == "uncertain":
+            self.set_status("对话意图或事实不确定，建议先澄清或等待。", "warning")
+        elif not self._current and self.cands:
+            self.set_status("此建议已过期，可以复制并自行检查。", "warning")
+        elif result.get("ranking_status") == "failed":
+            self.set_status("已生成候选，排序不可用，请自行判断。", "warning")
+        elif result.get("status") == "partial":
+            self.set_status("只完成了部分分析，请自行判断。", "warning")
+        elif self.cands:
             self.set_status("建议已更新，选一句适合你的回复", "success")
         else:
             self.set_status("未生成可用回复，请等待下一条新消息。", "error")

@@ -86,18 +86,19 @@ def _error_body(exc: urllib.error.HTTPError) -> str:
 
 
 def ask(state: dict, questions: dict, timeout: float = 20,
-        provider: str = "openrouter", model: str | None = None) -> dict:
+        provider: str = "openrouter", model: str | None = None, *,
+        api_key: str | None = None, bounded: bool = False) -> dict:
     """问 Jev 一轮判断，返回 {"answers": {名字: 答案}, "usage": {...}}。
 
     provider ∈ JEV_PROVIDERS（openrouter / typesafe 直连）；model=None 用该来源的默认模型。
     两条路返回的 dict 形状一模一样，429/529 都会退避重试。绝不打印或写出 key。
     """
     spec = JEV_PROVIDERS.get(provider) or JEV_PROVIDERS["openrouter"]
-    key = _api_key(JEV_ENV)  # 两家共用同一把 key，换来源不用重填
+    key = api_key if api_key is not None else _api_key(JEV_ENV)
     model = model or spec.default
     if provider == "typesafe":
         return _ask_typesafe(state, questions, key, model, timeout)
-    return _ask_openrouter(state, questions, key, model, timeout)
+    return _ask_openrouter(state, questions, key, model, timeout, retries=0 if bounded else MAX_RETRIES)
 
 
 def _answer(answer) -> dict:
@@ -131,7 +132,8 @@ def _ask_typesafe(state: dict, questions: dict, key: str, model: str, timeout: f
     }
 
 
-def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float) -> dict:
+def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout: float,
+                    retries: int = MAX_RETRIES) -> dict:
     """OpenRouter 的 /api/alpha/decisions，手写 urllib。429/529 退避重试 3 次。"""
     payload = json.dumps(
         {"model": model, "state": state, "questions": questions},
@@ -140,7 +142,7 @@ def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout:
 
     last_status: int | None = None
     last_body = ""
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(retries + 1):
         req = urllib.request.Request(
             OPENROUTER_DECISIONS,
             data=payload,
@@ -158,24 +160,24 @@ def _ask_openrouter(state: dict, questions: dict, key: str, model: str, timeout:
         except urllib.error.HTTPError as exc:
             last_status = exc.code
             last_body = _error_body(exc)
-            if last_status in (429, 529) and attempt < MAX_RETRIES:
+            if last_status in (429, 529) and attempt < retries:
                 time.sleep(2**attempt)
                 continue
             readable = {
                 401: f"Jev HTTP 401: API key rejected. Check {JEV_ENV}.",
                 422: f"Jev HTTP 422: request body rejected. {last_body}",
-                429: f"Jev HTTP 429: rate limited after {MAX_RETRIES} retries. {last_body}",
-                529: f"Jev HTTP 529: provider overloaded after {MAX_RETRIES} retries. {last_body}",
+                429: f"Jev HTTP 429: rate limited after {retries} retries. {last_body}",
+                529: f"Jev HTTP 529: provider overloaded after {retries} retries. {last_body}",
             }.get(last_status, f"Jev HTTP {last_status}: {last_body}")
             raise JevError(readable, last_status) from None
         except (TimeoutError, socket.timeout) as exc:
-            if attempt < MAX_RETRIES:
+            if attempt < retries:
                 time.sleep(2**attempt)
                 continue
             raise JevError(f"Jev request timed out after {timeout}s") from exc
         except urllib.error.URLError as exc:
             reason = redact_secrets(getattr(exc, "reason", exc))
-            if attempt < MAX_RETRIES:
+            if attempt < retries:
                 time.sleep(2**attempt)
                 continue
             raise JevError(f"Jev request failed: {reason}") from None

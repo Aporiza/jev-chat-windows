@@ -109,16 +109,15 @@ def main() -> int:
     if block:
         print("\n" + block)
 
-    print("\n候选（Jev 排序，★ = 推荐）:")
+    print(f"\n候选（{r['ranking_status']}，★ = 推荐）")
     scores = r.get("scores")
     for i, c in enumerate(r["candidates"]):
-        pct = f"  {scores[i]:.0%}" if scores else ""
+        pct = f"  {scores[i]:.0%}" if i < len(scores) and scores[i] is not None else ""
         print(f"  {'★' if i == r['best_index'] else ' '} {c}{pct}")
 
     u = r["usage"]
     if u:
-        print(f"\nusage: in={u.get('input_tokens')} out={u.get('output_tokens')} "
-              f"cost=${u.get('cost')}")
+        print(f"\nJev 用量 {u}")
     print("\n期望核对: true_intent≈confirm_you_care, best_action≈check_history, danger_level 中高档")
     return 0
 

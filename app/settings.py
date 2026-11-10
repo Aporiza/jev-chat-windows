@@ -10,6 +10,9 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+from dataclasses import dataclass
+from hashlib import sha256
+
 import sys  # 只为下面这一处：打包后 __file__ 指向临时解包目录，config.json 得放在 exe 旁边才存得住
 
 from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGACY, LLM_ENV
@@ -17,31 +20,41 @@ from core.providers import CUSTOM, DRAFT_PROVIDERS, JEV_ENV, JEV_PROVIDERS, LEGA
 _ROOT = (os.path.dirname(sys.executable) if getattr(sys, "frozen", False)
          else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _CONFIG = os.path.join(_ROOT, "config.json")
-_DEFAULT_RELATIONSHIP = "romantic partners"
+_DEFAULT_RELATIONSHIP = "unspecified"
 _DEFAULT_CONTEXT = 10
 _DEFAULT_JEV = "openrouter"
 _DEFAULT_DRAFT = "deepseek"
 
 
-def _read(name: str, default=None):
-    """读 config.json 里的一个字段；每次都重新读文件，改设置不用重启进程。"""
+def _config():
     try:
         with open(_CONFIG, encoding="utf-8") as f:
-            value = json.load(f).get(name)
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        return default
+        return {}
+
+
+def _read(name: str, default=None):
+    value = _config().get(name)
     return default if value is None else value
+
+
+def _context(value):
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return _DEFAULT_CONTEXT
+    return max(3, min(30, n))
+
 
 def relationship() -> str:
     return str(_read("relationship") or _DEFAULT_RELATIONSHIP)
 
 def context() -> int:
     """参考上下文条数：起草和判断各看最近多少条消息。3~30，缺失/脏数据一律退默认值。"""
-    try:
-        n = int(_read("context", _DEFAULT_CONTEXT))
-    except (TypeError, ValueError):
-        return _DEFAULT_CONTEXT
-    return max(3, min(30, n))
+    return _context(_read("context"))
+
 
 def style() -> str:
     """用户自己描述的说话风格（可选，自由文本），只喂给起草模型。默认空 = 只照着最近的消息模仿。"""
@@ -147,17 +160,103 @@ def has_llm_key() -> bool:
 
 has_key = has_jev_key  # 旧名字：界面上「配没配好」问的就是判断模型这把 key
 
+def _preferences(data, title):
+    scoped = data.get("chat_preferences")
+    key = sha256(title.encode("utf-8")).hexdigest() if title else ""
+    values = scoped.get(key) if key and isinstance(scoped, dict) else None
+    values = values if isinstance(values, dict) else {}
+    return (str(values.get("relationship", data.get("relationship")) or _DEFAULT_RELATIONSHIP),
+            str(values.get("style", data.get("style")) or ""),
+            str(values.get("goal", data.get("goal")) or ""))
+
+
+def preferences(title=""):
+    return _preferences(_config(), title)
+
+
+def save_preferences(title, relationship, style, goal):
+    """仅保存用户填写的偏好。标题以摘要为索引，不写入标题或识别到的对话。"""
+    save(preference_title=title, relationship_text=relationship, style_text=style, goal_text=goal)
+
+
+@dataclass(frozen=True)
+class AnalysisSettings:
+    relationship: str
+    style: str
+    goal: str
+    context: int
+    reply_target: bool
+    thinking: bool
+    jev_provider: str
+    jev_model: str
+    draft_provider: str
+    draft_model: str
+    draft_base_url: str
+    jev_key: str
+    llm_key: str
+
+
+def analysis_settings(title):
+    data = _config()
+    jev = data.get("jev_provider")
+    jev = jev if isinstance(jev, str) and jev in JEV_PROVIDERS else _DEFAULT_JEV
+    draft = data.get("draft_provider")
+    draft = draft if isinstance(draft, str) and draft in DRAFT_PROVIDERS else _DEFAULT_DRAFT
+    return AnalysisSettings(
+        *_preferences(data, title), _context(data.get("context")),
+        bool(data.get("reply_target")), bool(data.get("thinking")),
+        jev, str(data.get("jev_model") or JEV_PROVIDERS[jev].default),
+        draft, str(data.get("draft_model") or DRAFT_PROVIDERS[draft].default),
+        str(data.get("draft_base_url") or "") if draft in CUSTOM else "",
+        jev_key(), llm_key(),
+    )
+
+
 def save(relationship_text: str | None = None, context_n: int | None = None, *,
          jev_provider_text: str | None = None, jev_key_text: str | None = None,
          jev_model_text: str | None = None, draft_provider_text: str | None = None,
          llm_key_text: str | None = None, draft_model_text: str | None = None,
          draft_base_url_text: str | None = None, reply_target_on: bool | None = None,
          style_text: str | None = None, thinking_on: bool | None = None,
-         check_update_on: bool | None = None, debug_view_on: bool | None = None) -> None:
-    """每个参数为空/None = 保留当前值。两把 key 写进程环境 + HKCU\\Environment，不写任何文件。"""
-    jev = jev_provider_text if jev_provider_text in JEV_PROVIDERS else jev_provider()
-    draft = draft_provider_text if draft_provider_text in DRAFT_PROVIDERS else draft_provider()
-    # 没重填就把老变量里的值抄进新名字，迁移一次性做完（_get_key 已经退回读过老的了）
+         check_update_on: bool | None = None, debug_view_on: bool | None = None,
+         preference_title: str = "", goal_text: str | None = None) -> None:
+    """None 保留当前值。密钥只写进程环境和 HKCU\\Environment。"""
+    data = _config()
+    for name, value in (
+        ("context", None if context_n is None else _context(context_n)),
+        ("jev_provider", jev_provider_text), ("jev_model", jev_model_text),
+        ("draft_provider", draft_provider_text), ("draft_model", draft_model_text),
+        ("draft_base_url", draft_base_url_text), ("reply_target", reply_target_on),
+        ("thinking", thinking_on), ("check_update", check_update_on), ("debug_view", debug_view_on),
+    ):
+        if value is not None:
+            data[name] = value.strip() if isinstance(value, str) else value
+    values = data
+    if preference_title:
+        key = sha256(preference_title.encode("utf-8")).hexdigest()
+        if not isinstance(data.get("chat_preferences"), dict):
+            data["chat_preferences"] = {}
+        scoped = data["chat_preferences"]
+        if not isinstance(scoped.get(key), dict):
+            scoped[key] = {}
+        values = scoped[key]
+    for name, value in (("relationship", relationship_text), ("style", style_text), ("goal", goal_text)):
+        if value is not None:
+            values[name] = value.strip()
+    # 原子替换，保存失败时保留旧设置；密钥始终在文件操作完成之后保存。
+    from tempfile import NamedTemporaryFile
+
+    path = None
+    try:
+        with NamedTemporaryFile("w", dir=os.path.dirname(_CONFIG) or ".", encoding="utf-8",
+                                delete=False) as f:
+            path = f.name
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(path, _CONFIG)
+        path = None
+    finally:
+        if path is not None:
+            os.unlink(path)
     wrote_key = False
     for env, typed in ((JEV_ENV, jev_key_text), (LLM_ENV, llm_key_text)):
         value = typed or ("" if _read_env(env) else _get_key(env))
@@ -166,23 +265,3 @@ def save(relationship_text: str | None = None, context_n: int | None = None, *,
             wrote_key = True
     if wrote_key:
         _notify_env()
-    n = context() if context_n is None else max(3, min(30, int(context_n)))
-    # 空串 = 清掉，None = 原样留着（读原始字段，别读补过默认值的那个）
-    keep = lambda new, name: str(_read(name) or "") if new is None else str(new).strip()
-    flag = lambda new, now: now() if new is None else bool(new)
-    # 整个 dict 必须在 open(..., "w") **之前**拼好：open 一上来就把文件截断，
-    # 之后再 _read() 读到的是空文件，None 那几项就不是「保留」而是被清空了。
-    data = {
-        # 关系为空 = 只改别的开关（调试视图那种单项保存），别把它写没了
-        "relationship": relationship_text or relationship(), "context": n,
-        "style": keep(style_text, "style"),
-        "jev_provider": jev, "jev_model": keep(jev_model_text, "jev_model"),
-        "draft_provider": draft, "draft_model": keep(draft_model_text, "draft_model"),
-        "draft_base_url": keep(draft_base_url_text, "draft_base_url"),
-        "reply_target": flag(reply_target_on, reply_target),
-        "thinking": flag(thinking_on, thinking),
-        "check_update": flag(check_update_on, check_update),
-        "debug_view": flag(debug_view_on, debug_view),
-    }
-    with open(_CONFIG, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)

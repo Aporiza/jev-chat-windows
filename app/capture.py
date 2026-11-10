@@ -2,6 +2,8 @@
 """找聊天窗口 + Windows Graphics Capture 盯着它 + 从帧里定位消息区。帧全程内存，绝不落盘。"""
 import ctypes
 import os
+import threading
+from hashlib import blake2b
 import time
 from ctypes import wintypes
 
@@ -10,6 +12,15 @@ import numpy as np
 from app import chatapps
 
 u32 = ctypes.windll.user32
+u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+u32.IsWindow.argtypes = [wintypes.HWND]
+
+
+def window_identity(hwnd):
+    pid = wintypes.DWORD()
+    thread = u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return (pid.value, thread) if thread and u32.IsWindow(hwnd) else None
 
 
 def find_chat_hwnd(want=None):
@@ -83,21 +94,31 @@ def chat_area(full, header_h=60):
     认不出（窗口太小 / 拖到一半布局没铺好）返回 None。
     ponytail: 输入框拉高超过面板一半会认错；header_h 按 100% DPI 给的，缩放了按比例调。"""
     H, W = full.shape[:2]
+    if H < 150 or W < 150 or not full.any():
+        return None
     right = full[::8, W // 2::8].reshape(-1, 3)
     vals, cnt = np.unique(right, axis=0, return_counts=True)
     bg = vals[cnt.argmax()]
     isbg = np.abs(full.astype(int) - bg).sum(-1) <= 6
     col = isbg[H // 4: H * 3 // 4].mean(0)
+    if not (col > 0.3).any():
+        return None
     x0 = int(np.argmax(col > 0.3))
     x1 = W - int(np.argmax(col[::-1] > 0.3))
+    if x1 - x0 < 140:
+        return None
     row = isbg[:, x0:x1].mean(1)
+    if not (row > 0.9).any():
+        return None
     y0 = int(np.argmax(row > 0.9))
     y1 = H - int(np.argmax(row[::-1] > 0.9))
     band = full[y0:y1, x0:x1].astype(int)
     seps = y0 + np.where((band.std(axis=(1, 2)) < 4) & (row[y0:y1] < 0.1))[0]
     seps = [int(s) for i, s in enumerate(seps) if i == 0 or s - seps[i - 1] > 3]
     below = [s for s in seps if s > y0 + 0.45 * (y1 - y0)]
-    y_in = below[0] if below else y1
+    if not below or y1 - below[0] < 60:
+        return None
+    y_in = below[0]
     above = [s for s in seps if y0 + header_h < s < y_in - 50]
     y_top = above[-1] if above else y0 + header_h
     if x1 - x0 < 100 or y_in - y_top < 40:
@@ -105,54 +126,91 @@ def chat_area(full, header_h=60):
     return x0, y_top, x1, y_in, bg, y0
 
 
-class Capture:
-    """WGC 盯窗口。采集线程只做「跟上一帧比」；settled() 在画面停稳后交出整帧，中间帧（滚动动画、
-    新消息滑入的半截气泡）全跳过。动图表情永远停不稳，所以最多等 max_wait 秒照样交。"""
+def layout_signature(full, area):
+    """只在内存中比较当前窗口尺寸、标题区和消息区。"""
+    x0, y0, x1, y1, _, pane_top = area
+    relevant = np.ascontiguousarray(full[pane_top:y1 + 4, x0:x1])
+    return (full.shape[:2], (x0, y0, x1, y1, pane_top), blake2b(relevant, digest_size=16).digest())
 
-    def __init__(self, hwnd, settle=0.25, max_wait=1.0):
+
+def fresh_layout(hwnd, timeout=1.0):
+    """新建 WGC 会话，获取本次填入过程中才采到的窗口帧。"""
+    try:
+        cap = Capture(hwnd, settle=0.12, max_wait=timeout)
+    except Exception:
+        return None
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and cap.alive():
+            packet = cap.settled()
+            if packet is not None:
+                _, frame = packet
+                area = chat_area(frame)
+                return layout_signature(frame, area) if area is not None else None
+            time.sleep(0.02)
+        return None
+    finally:
+        cap.stop()
+
+
+class Capture:
+    """WGC 帧稳定后交给 OCR。原始画面变动时先使父进程中的旧结果失效。"""
+
+    def __init__(self, hwnd, settle=0.25, max_wait=1.0, changed=None):
         from windows_capture import WindowsCapture
 
         self.settle, self.max_wait = settle, max_wait
-        self.shape = self.area = self.last = self.pending = None
+        self.area = self.last = self.pending = None
+        self.shape = self.latest = None
         self.t = self.t0 = 0.0
-        # 包装层默认 cursor_capture=True，会去调 SetIsCursorCaptureEnabled。
-        # 这个属性要 Win10 2004（build 19041）才有，1909 及更早直接抛 CursorConfigUnsupported。
-        # 显式 None 走系统默认，不去切换；draw_border 同理。
+        self.changed = changed
+        self.lock = threading.Lock()
+        # None 保留旧版 Windows 支持。输入区和鼠标位于标题/消息区之外时不会影响比较。
         cap = WindowsCapture(cursor_capture=None, draw_border=None, window_hwnd=hwnd)
         cap.event(self.on_frame_arrived)
         cap.event(self.on_closed)
         self.ctl = cap.start_free_threaded()
 
     def on_frame_arrived(self, frame, control):
-        full = np.ascontiguousarray(frame.frame_buffer[:, :, :3][:, :, ::-1])  # BGRA → RGB；缓冲区回调后就没了，必须拷
-        if full.max() == 0:
-            return
-        if self.area is None or full.shape != self.shape:
-            self.shape, self.area = full.shape, chat_area(full)
-        if self.area is None:
-            return
-        x0, y0, x1, y1 = self.area[:4]  # 拿上一次的消息区做 diff 就够了，光标闪烁在输入框里，不算变化
-        # ponytail: diff 不含头部——公告条会滚动，带上它就永远停不稳。切会话时消息区必然也变，照样出帧。
-        chat = full[y0:y1, x0:x1]
-        if self.last is not None and np.array_equal(chat, self.last):
-            return
-        self.last = chat
-        if self.pending is None:
-            self.t0 = time.perf_counter()
-        self.pending, self.t = full, time.perf_counter()
+        full = np.ascontiguousarray(frame.frame_buffer[:, :, :3][:, :, ::-1])
+        with self.lock:
+            if full.shape != self.shape:
+                self.shape = full.shape
+                self.area = None
+            area = self.area
+            # 失去布局/黑屏也是状态变化，不能留下此前的已确认帧。
+            view = layout_signature(full, area) if area is not None else (
+                full.shape, blake2b(full, digest_size=16).digest())
+            if view == self.last:
+                return
+            self.last = view
+            stamp = self.changed() if self.changed else None
+            now = time.monotonic()
+            if self.pending is None:
+                self.t0 = now
+            self.latest = self.pending = (stamp, full)
+            self.t = now
 
     def on_closed(self):
-        pass
+        if self.changed:
+            self.changed()
 
     def settled(self):
-        """停稳了就返回整帧，否则 None。"""
-        if self.pending is None:
-            return None
-        now = time.perf_counter()
-        if now - self.t < self.settle and now - self.t0 < self.max_wait:
-            return None
-        full, self.pending = self.pending, None
-        return full
+        with self.lock:
+            if self.pending is None:
+                return None
+            now = time.monotonic()
+            if now - self.t < self.settle and now - self.t0 < self.max_wait:
+                return None
+            packet, self.pending = self.pending, None
+            return packet
+
+    def set_area(self, area, stamp):
+        with self.lock:
+            if self.latest is not None and self.latest[0] == stamp:
+                self.area = area
+                if area is not None:
+                    self.last = layout_signature(self.latest[1], area)
 
     def alive(self):
         return not self.ctl.is_finished()
@@ -161,4 +219,4 @@ class Capture:
         self.ctl.stop()
 
     def wait(self):
-        self.ctl.wait()  # 采集线程若是报错死的，这里把错误抛出来
+        self.ctl.wait()

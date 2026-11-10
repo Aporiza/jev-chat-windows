@@ -27,7 +27,7 @@ def _turns(user_turns: list[str], assistant: str = "assistant") -> list[dict]:
 def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: str,
          user_turns: list[str], *, temperature: float = 1.0, max_tokens: int = 400,
          thinking: bool = False, extra_body: dict | None = None,
-         headers: dict | None = None, timeout: float = 30) -> str:
+         headers: dict | None = None, timeout: float = 30, usage_sink=None) -> str:
     """发一轮对话，返回模型输出的纯文本。
 
     user_turns: 用户/助手交替的文本，奇数条，首尾都是用户说的（追问补齐候选就是 3 条）。
@@ -36,21 +36,27 @@ def chat(protocol: str, base_url: str | None, api_key: str, model: str, system: 
     """
     if protocol == "anthropic":
         return _anthropic(base_url, api_key, model, system, user_turns,
-                          temperature, max_tokens, thinking, timeout)
+                          temperature, max_tokens, thinking, timeout, usage_sink)
     if protocol == "gemini":
         return _gemini(base_url, api_key, model, system, user_turns,
-                       temperature, max_tokens, thinking, timeout)
+                       temperature, max_tokens, thinking, timeout, usage_sink)
     return _openai(base_url, api_key, model, system, user_turns,
-                   temperature, max_tokens, extra_body, headers, timeout)
+                   temperature, max_tokens, extra_body, headers, timeout, usage_sink)
+
+
+def _usage(sink, raw, **fields):
+    if sink and raw is not None:
+        values = {name: getattr(raw, field, None) for name, field in fields.items()}
+        sink({name: value for name, value in values.items() if type(value) in (int, float)})
 
 
 def _openai(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            extra_body, headers, timeout) -> str:
+            extra_body, headers, timeout, usage_sink) -> str:
     import openai
 
     try:
         client = openai.OpenAI(base_url=base_url or None, api_key=api_key,
-                               timeout=timeout, max_retries=2,
+                               timeout=timeout, max_retries=0,
                                **({"default_headers": headers} if headers else {}))
         resp = client.chat.completions.create(
             model=model,
@@ -60,11 +66,13 @@ def _openai(base_url, api_key, model, system, user_turns, temperature, max_token
             **({"extra_body": extra_body} if extra_body else {}))
     except Exception as exc:
         _fail(exc, "起草")
+    _usage(usage_sink, getattr(resp, "usage", None), input_tokens="prompt_tokens",
+           output_tokens="completion_tokens", cost="cost")
     return resp.choices[0].message.content or ""
 
 
 def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-               thinking, timeout) -> str:
+               thinking, timeout, usage_sink) -> str:
     import anthropic
 
     extra = {}
@@ -74,13 +82,16 @@ def _anthropic(base_url, api_key, model, system, user_turns, temperature, max_to
         max_tokens = max(max_tokens, _THINK_BUDGET + 1024)  # max_tokens 得装得下思考 + 正文
     try:
         client = anthropic.Anthropic(base_url=base_url or None, api_key=api_key,
-                                     timeout=timeout, max_retries=2)
+                                     timeout=timeout, max_retries=0)
         message = client.messages.create(model=model, system=system,
                                          messages=_turns(user_turns), max_tokens=max_tokens,
                                          temperature=temperature, **extra)
     except Exception as exc:
         _fail(exc, "起草")
     # 开了思考的话前面还有 thinking 块，只取文本块
+    _usage(usage_sink, getattr(message, "usage", None), input_tokens="input_tokens",
+           output_tokens="output_tokens", cache_read_input_tokens="cache_read_input_tokens",
+           cache_creation_input_tokens="cache_creation_input_tokens")
     return "".join(b.text for b in message.content if getattr(b, "type", "") == "text")
 
 
@@ -96,7 +107,7 @@ def _gemini_client(base_url, api_key, timeout):
 
 
 def _gemini(base_url, api_key, model, system, user_turns, temperature, max_tokens,
-            thinking, timeout) -> str:
+            thinking, timeout, usage_sink) -> str:
     try:
         client, types = _gemini_client(base_url, api_key, timeout)
         config = types.GenerateContentConfig(
@@ -108,6 +119,8 @@ def _gemini(base_url, api_key, model, system, user_turns, temperature, max_token
         resp = client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as exc:
         _fail(exc, "起草")
+    _usage(usage_sink, getattr(resp, "usage_metadata", None), input_tokens="prompt_token_count",
+           output_tokens="candidates_token_count", thinking_tokens="thoughts_token_count")
     return resp.text or ""
 
 
@@ -188,7 +201,7 @@ if __name__ == "__main__":
                temperature=1.2, max_tokens=400, extra_body={"thinking": {"type": "disabled"}})
     assert out == '["甲","乙","丙"]'
     assert seen["openai.init"]["base_url"] == "https://api.deepseek.com"
-    assert seen["openai.init"]["api_key"] == "sk-ds" and seen["openai.init"]["max_retries"] == 2
+    assert seen["openai.init"]["api_key"] == "sk-ds" and seen["openai.init"]["max_retries"] == 0
     assert seen["openai.call"]["model"] == "deepseek-flash"
     assert seen["openai.call"]["extra_body"] == {"thinking": {"type": "disabled"}}
     assert seen["openai.call"]["temperature"] == 1.2 and seen["openai.call"]["max_tokens"] == 400

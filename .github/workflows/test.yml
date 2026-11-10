@@ -1,20 +1,28 @@
 name: tests
 
 # 每次 push / PR 跑离线回归测试：不联网、不需要 key、不装 Qt/OCR 重依赖。
+# 同时覆盖 tests/test_core.py（pytest）和 tests/test_reliability.py（unittest 风格，pytest 也能收集）。
 on:
   push:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12']
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
           cache: pip
 
       - name: 装测试依赖

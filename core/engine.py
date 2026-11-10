@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
-"""整条链的唯一入口：对话 → Jev 判断 → 带着判断起草 3 条 → Jev 排序 → 结构化结果。
-
-平台无关。SSE 消费者、悬浮窗、命令行 demo 都只调 analyze()。
-"""
+"""对话 → Jev 判断 → 起草候选 → Jev 排序。"""
 from __future__ import annotations
+
+from math import isfinite
+from queue import Empty, Queue
+from threading import BoundedSemaphore, Thread
+from time import monotonic, time
 
 try:
     from .draft import draft_candidates
@@ -14,104 +16,191 @@ except ImportError:
     from jev_client import JevError, ask
     from questions import JUDGE_QUESTIONS, build_rank_question, build_state, guidance_text
 
+_NETWORK_SLOTS = BoundedSemaphore(4)
 _REPLY_IDX = {"reply_a": 0, "reply_b": 1, "reply_c": 2}
 
 
-def _add_usage(total: dict, one: dict | None) -> None:
-    """两次 Jev 调用的 usage 相加（tokens、cost）；非数字的字段后来的盖掉前面的。"""
-    for k, v in (one or {}).items():
-        total[k] = total.get(k, 0) + v if isinstance(v, (int, float)) else v
+class ObsoleteAnalysis(Exception):
+    """请求已被新消息或界面状态替代。"""
+
+
+class _Budget:
+    def __init__(self, timeout, is_current):
+        self.deadline = monotonic() + timeout
+        self.is_current = is_current
+
+    def check(self):
+        if not self.is_current():
+            raise ObsoleteAnalysis
+
+    def remaining(self):
+        self.check()
+        remaining = self.deadline - monotonic()
+        if remaining <= 0:
+            raise JevError("已达到生成时限")
+        return remaining
+
+    def request(self, send):
+        """总时限也覆盖 SDK 内部重试及可能迟迟不返回的读取。"""
+        output = Queue(1)
+
+        def run():
+            try:
+                value = send(remaining)
+            except Exception as exc:
+                output.put((False, exc))
+            else:
+                output.put((True, value))
+            finally:
+                _NETWORK_SLOTS.release()
+
+        while not _NETWORK_SLOTS.acquire(timeout=min(0.05, self.remaining())):
+            pass
+        try:
+            remaining = self.remaining()
+            Thread(target=run, daemon=True).start()
+        except BaseException:
+            _NETWORK_SLOTS.release()
+            raise
+        while True:
+            try:
+                ok, value = output.get(timeout=min(0.05, self.remaining()))
+            except Empty:
+                continue
+            self.remaining()
+            if ok:
+                return value
+            raise value
+
+
+def _add_usage(total, usage):
+    if not isinstance(usage, dict):
+        return
+    for name, value in usage.items():
+        if type(value) in (int, float) and isfinite(value):
+            total[name] = total.get(name, 0) + value
+
+
+def _choice(answers, question):
+    answer = answers.get(question)
+    return answer.get("choice") if isinstance(answer, dict) else None
 
 
 def analyze(messages: list, relationship: str, model: str | None = None,
             timeout: float = 30, context: int = 10, provider: str = "deepseek",
             base_url: str | None = None, reply_to: str | None = None, style: str = "",
             thinking: bool = False, jev_provider: str = "openrouter",
-            jev_model: str | None = None) -> dict:
-    """messages: [(from, text)] from ∈ {her, me}，最新一条在最后；
-    群聊里可以带第三项 name（说这句话的人），单聊不带。
-    context: 起草和判断各看最近多少条消息（用户设置里的「参考上下文」）。
-    provider: 起草走哪家（core.providers.DRAFT_PROVIDERS），base_url 只有自定义来源要传。
-    jev_provider / jev_model: 判断和排序走哪家、哪个模型（core.providers.JEV_PROVIDERS）。
-    reply_to: 群聊里指定回复给谁；None = 正常回复。
-    style: 用户自己描述的说话风格，只影响起草。
-    thinking: 起草时是否开思考模式，只影响起草，默认关。
-    model / jev_model = None 用该来源的默认模型。
+            jev_model: str | None = None, *, goal: str = "", is_current=lambda: True,
+            jev_key: str | None = None, llm_key: str | None = None) -> dict:
+    """按总时限生成建议。best_index 为 None 表示没有可信排序。"""
+    started = monotonic()
+    budget = _Budget(timeout, is_current)
+    state = build_state(messages, relationship, keep=context, reply_to=reply_to, goal=goal)
+    answers, usage, stages = {}, {}, {}
 
-    返回 {candidates, best_index, best_reply, scores, answers, usage, reply_to}。
-    scores 是每条候选的胜出概率（0~1），取自 best_reply.probabilities，取不到记 0.0。
-    只有对方最新说话时才有意义调它——是不是该触发由调用方判断（看 latest_from）。
-
-    三段式（issue #4）：先让 Jev 答 7 道判断题，把判断当小抄喂给起草，最后 Jev 只排序。
-    判断那次挂了就退回老路：盲起草 + 判断和排序一次问完，行为跟以前一样。usage 是两次之和。
-    """
-    state = build_state(messages, relationship, keep=context, reply_to=reply_to)
-    usage: dict = {}
-    answers: dict = {}
-    judged = False
-    try:
-        first = ask(state, dict(JUDGE_QUESTIONS), timeout=timeout,
-                    provider=jev_provider, model=jev_model)
-        answers = first.get("answers") or {}
-        _add_usage(usage, first.get("usage"))
-        judged = True
-    except JevError:
-        pass  # 退回盲起草 + 老的一次合问；错误不打日志（里面可能带请求内容）
-
-    candidates = draft_candidates(messages, relationship, provider=provider, model=model,
-                                  base_url=base_url, timeout=timeout, keep=context,
-                                  reply_to=reply_to, style=style, thinking=thinking,
-                                  guidance=guidance_text(answers) if judged else None)
-    if not candidates:  # 注入过滤可以把起草结果全扔掉；接着取 [0] 会 IndexError
-        raise JevError("起草结果没有可用候选回复")
-
-    questions = {} if judged else dict(JUDGE_QUESTIONS)
-    if len(candidates) >= 2:  # 起草只给了 1 条就没什么可排的，判断题照问
-        questions.update(build_rank_question(candidates))
-    if questions:
+    def stage(name, operation, stage_usage=None):
+        started_at = monotonic()
+        metrics = stages[name] = {"status": "ok", "usage": stage_usage if stage_usage is not None else {}}
         try:
-            second = ask(state, questions, timeout=timeout,
-                         provider=jev_provider, model=jev_model)
+            return operation()
         except JevError:
-            if not judged:  # 老路只有这一次调用，挂了就是挂了
-                raise
-            second = {}  # 判断还在，只是没排上序：下面按第一条推荐
-        answers = {**answers, **(second.get("answers") or {})}
-        _add_usage(usage, second.get("usage"))
+            metrics["status"] = "failed"
+            raise
+        finally:
+            metrics["elapsed_ms"] = round((monotonic() - started_at) * 1000)
 
-    best_key = (answers.get("best_reply") or {}).get("choice")
-    best_index = _REPLY_IDX.get(best_key, 0)  # 解析不出就退第一条
-    if best_index >= len(candidates):
-        best_index = 0
-
-    probabilities = (answers.get("best_reply") or {}).get("probabilities") or {}
-    scores = [0.0, 0.0, 0.0]
-    for key, idx in _REPLY_IDX.items():
+    def judge(name, questions):
+        def call():
+            result = budget.request(lambda remaining: ask(
+                state, questions, timeout=remaining, provider=jev_provider, model=jev_model,
+                api_key=jev_key, bounded=True))
+            if not isinstance(result, dict):
+                raise JevError("判断返回格式不可用")
+            _add_usage(stages[name]["usage"], result.get("usage"))
+            _add_usage(usage, result.get("usage"))
+            reported = result.get("answers")
+            if not isinstance(reported, dict):
+                raise JevError("判断答案格式不可用")
+            return {key: value for key, value in reported.items() if isinstance(value, dict)}
         try:
-            scores[idx] = float(probabilities.get(key, 0.0))
-        except (TypeError, ValueError):
-            scores[idx] = 0.0  # 脏数据一律按 0 处理
+            return stage(name, call)
+        except JevError:
+            return {}
 
+    answers.update(judge("judge", dict(JUDGE_QUESTIONS)))
+    boundary = (_choice(answers, "best_action") == "respect_boundary"
+                or _choice(answers, "true_intent") == "set_boundary")
+    candidates, best_index, scores = [], None, []
+    ranking_status = "skipped"
+    if not boundary:
+        budget.remaining()
+        draft_usage = {}
+        candidates = stage("draft", lambda: draft_candidates(
+            messages, relationship, provider=provider, model=model, base_url=base_url,
+            timeout=timeout, keep=context, reply_to=reply_to, style=style, thinking=thinking,
+            guidance=guidance_text(answers), goal=goal, api_key=llm_key, request=budget.request,
+            usage_sink=lambda reported: _add_usage(draft_usage, reported)), draft_usage)
+        if not candidates:
+            raise JevError("起草结果没有可用候选回复")
+        budget.check()
+        if len(candidates) >= 2:
+            questions = build_rank_question(candidates)
+            if not answers:
+                questions.update(JUDGE_QUESTIONS)
+            ranking = judge("rank", questions)
+            answers.update(ranking)
+            best_key = _choice(ranking, "best_reply")
+            best_index = _REPLY_IDX.get(best_key) if isinstance(best_key, str) else None
+            if best_index is not None and best_index < len(candidates):
+                ranking_status = "ranked"
+                probabilities = ranking["best_reply"].get("probabilities")
+                probabilities = probabilities if isinstance(probabilities, dict) else {}
+                scores = [None] * len(candidates)
+                for key, idx in _REPLY_IDX.items():
+                    value = probabilities.get(key)
+                    if idx < len(scores) and type(value) in (int, float) and 0 <= value <= 1:
+                        scores[idx] = value
+            else:
+                ranking_status, best_index = "failed", None
+                stages["rank"]["status"] = "failed"
+        else:
+            ranking_status = "single_candidate"
+        boundary = (_choice(answers, "best_action") == "respect_boundary"
+                    or _choice(answers, "true_intent") == "set_boundary")
+        if boundary:
+            candidates, best_index, scores, ranking_status = [], None, [], "skipped"
+
+    budget.check()
+    uncertain = (_choice(answers, "best_action") == "clarify"
+                 or _choice(answers, "true_intent") == "uncertain")
+    status = ("boundary" if boundary else "uncertain" if uncertain else "partial"
+              if len(candidates) < 3 or ranking_status != "ranked" or not _choice(answers, "best_action")
+              else "complete")
     return {
         "candidates": candidates,
         "best_index": best_index,
-        "best_reply": candidates[best_index],
+        "best_reply": candidates[best_index] if best_index is not None else None,
         "scores": scores,
         "answers": answers,
         "usage": usage,
+        "stages": stages,
+        "elapsed_ms": round((monotonic() - started) * 1000),
+        "ranking_status": ranking_status,
+        "status": status,
+        "generated_at": time(),
         "reply_to": reply_to,
     }
 
 
 if __name__ == "__main__":
-    # 候选被过滤光时要抛 JevError，不能在取第一条时 IndexError。
     from unittest.mock import patch
 
     with patch("__main__.ask", return_value={"answers": {}, "usage": {}}), \
          patch("__main__.draft_candidates", return_value=[]):
         try:
             analyze([("her", "hello")], "friends")
+        except JevError as exc:
+            assert "没有可用候选" in str(exc)
+        else:
             raise SystemExit("应当抛错")
-        except JevError as e:
-            assert "没有可用候选" in str(e)
     print("engine ok")
